@@ -1,0 +1,318 @@
+"""
+Streamlit 展示：香港科技100 一致预期 + 股价走势（交互式重构版）
+
+启动方式：
+    streamlit run app/dashboard.py
+"""
+import io
+import sqlite3
+from io import StringIO
+from pathlib import Path
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import streamlit as st
+
+# 中文字体设置（macOS）
+plt.rcParams["font.sans-serif"] = ["Heiti TC", "Arial Unicode MS"]
+plt.rcParams["axes.unicode_minus"] = False
+
+ROOT = Path(__file__).parent.parent.resolve()
+DB_PATH = ROOT / "data" / "wind_history.db"
+
+st.set_page_config(page_title="香港科技100 一致预期看板", layout="wide")
+
+
+# ============== 数据库查询 ==============
+def get_conn():
+    return sqlite3.connect(DB_PATH)
+
+
+@st.cache_data(ttl=60)
+def get_available_dates():
+    conn = get_conn()
+    df = pd.read_sql_query(
+        "SELECT DISTINCT update_date FROM weekly_data ORDER BY update_date DESC", conn
+    )
+    conn.close()
+    return df["update_date"].tolist()
+
+
+@st.cache_data(ttl=60)
+def get_codes_names(update_date):
+    conn = get_conn()
+    df = pd.read_sql_query(
+        """SELECT DISTINCT wind_code, name FROM weekly_data
+           WHERE update_date = ? ORDER BY wind_code""",
+        conn,
+        params=(update_date,),
+    )
+    conn.close()
+    return df
+
+
+@st.cache_data(ttl=60)
+def get_weekly_data(update_date):
+    conn = get_conn()
+    df = pd.read_sql_query(
+        """SELECT trade_date, wind_code, name, netprofit_avg, close_hkd
+           FROM weekly_data WHERE update_date = ? ORDER BY wind_code, trade_date""",
+        conn,
+        params=(update_date,),
+    )
+    conn.close()
+    df["trade_date"] = pd.to_datetime(df["trade_date"])
+    df["netprofit_avg"] = pd.to_numeric(df["netprofit_avg"], errors="coerce")
+    df["close_hkd"] = pd.to_numeric(df["close_hkd"], errors="coerce")
+    return df
+
+
+@st.cache_data(ttl=60)
+def get_static_data(update_date):
+    conn = get_conn()
+    df = pd.read_sql_query(
+        "SELECT * FROM static_indicators WHERE update_date = ? ORDER BY wind_code",
+        conn,
+        params=(update_date,),
+    )
+    conn.close()
+    return df
+
+
+# ============== 侧边栏筛选 ==============
+st.sidebar.header("筛选条件")
+
+available_dates = get_available_dates()
+if not available_dates:
+    st.error("数据库为空，请先运行采集脚本。")
+    st.stop()
+
+selected_date = st.sidebar.selectbox("数据日期", available_dates, index=0)
+
+# 加载数据
+weekly_df = get_weekly_data(selected_date)
+static_df = get_static_data(selected_date)
+codes_names_df = get_codes_names(selected_date)
+
+if weekly_df.empty:
+    st.warning(f"{selected_date} 没有 weekly 数据。")
+    st.stop()
+
+# 筛选方式
+filter_mode = st.sidebar.radio(
+    "筛选方式",
+    ["全部 100 只", "按股票代码", "按股票名称"],
+    index=0,
+)
+
+# 代码/名称下拉框（联动）
+all_codes = codes_names_df["wind_code"].tolist()
+all_names = codes_names_df["name"].tolist()
+code_to_name = dict(zip(codes_names_df["wind_code"], codes_names_df["name"]))
+name_to_code = dict(zip(codes_names_df["name"], codes_names_df["wind_code"]))
+
+selected_code = None
+selected_name = None
+
+if filter_mode == "按股票代码":
+    selected_code = st.sidebar.selectbox("股票代码", all_codes, index=0)
+    selected_name = code_to_name.get(selected_code, "")
+    st.sidebar.markdown(f"**公司名称**：{selected_name}")
+elif filter_mode == "按股票名称":
+    selected_name = st.sidebar.selectbox("股票名称", all_names, index=0)
+    selected_code = name_to_code.get(selected_name, "")
+    st.sidebar.markdown(f"**股票代码**：{selected_code}")
+
+
+# ============== 页面标题 ==============
+st.title("香港科技100 一致预期看板")
+st.caption(f"数据日期：{selected_date}")
+
+
+# ============== Tab 路由 ==============
+if filter_mode == "全部 100 只":
+    tabs = st.tabs(["📈 100只概览", "📋 静态指标"])
+    tab_overview, tab_static = tabs
+    tab_detail = None
+else:
+    tabs = st.tabs(["🔍 个股详情", "📈 100只概览", "📋 静态指标"])
+    tab_detail, tab_overview, tab_static = tabs
+
+
+# ============== 缓存渲染 100只概览 ==============
+@st.cache_data(ttl=3600)
+def render_overview_png(weekly_json: str, date_str: str) -> bytes:
+    """把 100 只概览渲染为 PNG 字节并缓存，避免每次刷新都重绘。"""
+    weekly_df = pd.read_json(StringIO(weekly_json), orient="split")
+    weekly_df["trade_date"] = pd.to_datetime(weekly_df["trade_date"])
+    grouped = weekly_df.groupby("wind_code")
+    codes = sorted(weekly_df["wind_code"].unique())
+    n_codes = len(codes)
+    n_cols = 4
+    n_rows = (n_codes + n_cols - 1) // n_cols
+
+    # 高 dpi + 合理 figsize，保证清晰度同时控制内存
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(20, 3.5 * n_rows), dpi=200, squeeze=False)
+    fig.patch.set_facecolor("white")
+
+    for idx, code in enumerate(codes):
+        row = idx // n_cols
+        col = idx % n_cols
+        ax = axes[row][col]
+
+        sub = grouped.get_group(code).sort_values("trade_date")
+        name = sub["name"].iloc[0] if not sub["name"].isna().all() else code
+
+        color1 = "#1f77b4"
+        ax.plot(sub["trade_date"], sub["netprofit_avg"], color=color1, linewidth=1.2, label="预测净利润")
+        ax.set_ylabel("净利润(百万)", color=color1, fontsize=9)
+        ax.tick_params(axis="y", labelcolor=color1, labelsize=7)
+
+        ax2 = ax.twinx()
+        color2 = "#ff7f0e"
+        ax2.plot(sub["trade_date"], sub["close_hkd"], color=color2, linewidth=1.2, linestyle="--", label="股价")
+        ax2.set_ylabel("股价(HKD)", color=color2, fontsize=9)
+        ax2.tick_params(axis="y", labelcolor=color2, labelsize=7)
+
+        # 标题字体加大，提升可读性
+        ax.set_title(f"{name}\n{code}", fontsize=11, fontweight="bold")
+
+        n_ticks = min(3, len(sub))
+        if n_ticks > 0:
+            step = max(1, len(sub) // n_ticks)
+            tick_positions = sub["trade_date"].iloc[::step]
+            ax.set_xticks(tick_positions)
+            ax.set_xticklabels([d.strftime("%m-%d") for d in tick_positions], rotation=45, ha="right", fontsize=6)
+
+        ax.grid(True, alpha=0.25, linestyle=":")
+
+    # 隐藏空白子图
+    for idx in range(n_codes, n_rows * n_cols):
+        row = idx // n_cols
+        col = idx % n_cols
+        axes[row][col].axis("off")
+
+    plt.tight_layout(pad=1.2)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    return buf.getvalue()
+
+
+# ============== Tab 1/2: 100只概览 (matplotlib) ==============
+with tab_overview:
+    st.subheader("预测净利润平均值 vs 股价")
+
+    codes = sorted(weekly_df["wind_code"].unique())
+    n_codes = len(codes)
+    if n_codes == 0:
+        st.warning("暂无数据。")
+    else:
+        # 用 JSON 串作为缓存 key（比直接传 DataFrame 更稳定）
+        png_bytes = render_overview_png(weekly_df.to_json(orient="split", date_format="iso"), selected_date)
+        st.image(png_bytes, use_container_width=True)
+
+
+# ============== Tab: 个股详情 (plotly 交互式) ==============
+if tab_detail is not None:
+    with tab_detail:
+        stock_df = weekly_df[weekly_df["wind_code"] == selected_code].sort_values("trade_date")
+
+        if stock_df.empty:
+            st.warning(f"{selected_code} 没有数据。")
+        else:
+            st.subheader(f"{selected_name} ({selected_code})")
+
+            # Plotly 交互式双Y轴图
+            fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+            fig.add_trace(
+                go.Scatter(
+                    x=stock_df["trade_date"],
+                    y=stock_df["netprofit_avg"],
+                    name="预测净利润（百万）",
+                    mode="lines+markers",
+                    line=dict(color="#1f77b4", width=2),
+                    marker=dict(size=4),
+                    hovertemplate="日期: %{x}<br>预测净利润: %{y:,.0f} 百万<extra></extra>",
+                ),
+                secondary_y=False,
+            )
+
+            fig.add_trace(
+                go.Scatter(
+                    x=stock_df["trade_date"],
+                    y=stock_df["close_hkd"],
+                    name="股价（HKD）",
+                    mode="lines+markers",
+                    line=dict(color="#ff7f0e", width=2, dash="dash"),
+                    marker=dict(size=4),
+                    hovertemplate="日期: %{x}<br>股价: %{y:,.2f} HKD<extra></extra>",
+                ),
+                secondary_y=True,
+            )
+
+            fig.update_layout(
+                title=dict(text=f"{selected_name} ({selected_code})", x=0.5),
+                hovermode="x unified",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+                margin=dict(l=60, r=60, t=80, b=40),
+                height=500,
+            )
+
+            fig.update_yaxes(title_text="预测净利润（百万）", secondary_y=False)
+            fig.update_yaxes(title_text="股价（HKD）", secondary_y=True)
+            fig.update_xaxes(title_text="日期")
+
+            st.plotly_chart(fig, use_container_width=True)
+
+            # 下方数据表格
+            st.subheader("📋 完整数据")
+            display_df = stock_df[["trade_date", "netprofit_avg", "close_hkd"]].copy()
+            display_df.columns = ["日期", "预测净利润平均值（百万）", "股价（HKD）"]
+            display_df["日期"] = display_df["日期"].dt.strftime("%Y-%m-%d")
+            display_df["预测净利润平均值（百万）"] = display_df["预测净利润平均值（百万）"].round(2)
+            display_df["股价（HKD）"] = display_df["股价（HKD）"].round(2)
+
+            st.dataframe(
+                display_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "日期": st.column_config.TextColumn("日期", width="small"),
+                    "预测净利润平均值（百万）": st.column_config.NumberColumn("预测净利润平均值（百万）", format="%.2f"),
+                    "股价（HKD）": st.column_config.NumberColumn("股价（HKD）", format="%.2f"),
+                },
+            )
+
+
+# ============== Tab 3: 静态指标 ==============
+with tab_static:
+    st.subheader(f"一致预期静态指标 — {selected_date}")
+    if static_df.empty:
+        st.warning("暂无静态指标数据。")
+    else:
+        rename_map = {
+            "wind_code": "股票代码",
+            "name": "公司名称",
+            "inst_num_2025": "2025预测机构家数",
+            "netprofit_avg_2025": "2025预测净利润平均(百万)",
+            "netprofit_median_2025": "2025预测净利润中值(百万)",
+            "inst_num_2026": "2026预测机构家数",
+            "netprofit_avg_2026": "2026预测净利润平均(百万)",
+            "netprofit_median_2026": "2026预测净利润中值(百万)",
+        }
+        display_cols = [c for c in rename_map.keys() if c in static_df.columns]
+        display_df = static_df[display_cols].rename(columns=rename_map)
+
+        # 数值格式化
+        for col in display_df.columns:
+            if "百万" in col:
+                display_df[col] = display_df[col].round(2)
+            elif "家数" in col:
+                display_df[col] = display_df[col].fillna(0).astype(int)
+
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+        st.caption("数据单位：百万元人民币 | 来源：Wind 一致预期")

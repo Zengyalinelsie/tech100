@@ -1,0 +1,55 @@
+[project]
+name = "tech100"
+version = "0.1.0"
+description = "香港科技100 Wind数据自动采集与Streamlit展示"
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+authors = [
+    {name = "User"},
+]
+keywords = ["wind", "hkex", "tech100", "streamlit", "finance"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "streamlit>=1.57",
+    "pandas>=2.0",
+    "openpyxl>=3.1",
+    "xlwings>=0.35",
+    "matplotlib>=3.10",
+    "plotly>=6.7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+tech100-init = "scripts.init_db:main"
+tech100-update = "scripts.update_wind_data:main"
+tech100-update-5s = "scripts.update_wind_data_5sheets:main"
+tech100-dashboard = "app.dashboard:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+
+[tool.uv]
+python-preference = "only-managed"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]
