@@ -17,7 +17,11 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
-from leadlag_analysis import compute_all_cross_correlations, build_event_study
+from leadlag_analysis import (
+    compute_all_cross_correlations,
+    bidirectional_prediction_regression,
+    build_event_study,
+)
 
 # Streamlit Cloud 上中文字体是在 packages.txt 阶段后安装的，
 # matplotlib 的字体缓存可能不包含它们，需要强制重新扫描。
@@ -380,6 +384,137 @@ with tab_leadlag:
                         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
                     )
                     st.plotly_chart(fig3, use_container_width=True)
+
+            # ── Layer 2: 领先-滞后预测能力 + 事件研究 ──
+            st.divider()
+            st.subheader("Layer 2：领先-滞后有多强？能区分买卖时机吗？")
+
+            with st.spinner("正在计算双向回归与事件研究（约需 10–20 秒）……"):
+                df_a, df_b = bidirectional_prediction_regression(hist_df, forward_weeks=(1, 2, 4))
+                events_df, event_agg = build_event_study(hist_df, window=8)
+
+            # ── 2A: 双向预测回归 ──
+            st.markdown("#### 📈 双向预测回归")
+            st.caption("方向 A：预期变化 → 未来股价收益 | 方向 B：股价收益 → 未来预期变化")
+
+            col_a, col_b = st.columns(2)
+
+            with col_a:
+                st.markdown("**方向 A：预期 → 股价**")
+                if not df_a.empty:
+                    agg_a = (
+                        df_a.groupby("lag")
+                        .agg(
+                            mean_beta=("beta", "mean"),
+                            std_beta=("beta", "std"),
+                            mean_r2=("r_squared", "mean"),
+                            std_r2=("r_squared", "std"),
+                            sig_pct=("p_value", lambda x: (x < 0.05).mean() * 100),
+                            n=("wind_code", "nunique"),
+                        )
+                        .reset_index()
+                    )
+                    agg_a.columns = ["前瞻周数", "β均值", "β标准差", "R²均值", "R²标准差", "β显著占比(%)", "股票数"]
+                    st.dataframe(agg_a.round(4), use_container_width=True, hide_index=True)
+                else:
+                    st.warning("方向 A 数据不足。")
+
+            with col_b:
+                st.markdown("**方向 B：股价 → 预期**")
+                if not df_b.empty:
+                    agg_b = (
+                        df_b.groupby("lag")
+                        .agg(
+                            mean_beta=("beta", "mean"),
+                            std_beta=("beta", "std"),
+                            mean_r2=("r_squared", "mean"),
+                            std_r2=("r_squared", "std"),
+                            sig_pct=("p_value", lambda x: (x < 0.05).mean() * 100),
+                            n=("wind_code", "nunique"),
+                        )
+                        .reset_index()
+                    )
+                    agg_b.columns = ["前瞻周数", "β均值", "β标准差", "R²均值", "R²标准差", "β显著占比(%)", "股票数"]
+                    st.dataframe(agg_b.round(4), use_container_width=True, hide_index=True)
+                else:
+                    st.warning("方向 B 数据不足。")
+
+            # 结论卡片
+            if not df_a.empty and not df_b.empty:
+                best_a = agg_a.loc[agg_a["R²均值"].idxmax()]
+                best_b = agg_b.loc[agg_b["R²均值"].idxmax()]
+                if best_a["R²均值"] > best_b["R²均值"]:
+                    conclusion = (
+                        f"方向 A 更强：预期变化对未来 **{int(best_a['前瞻周数'])} 周** 股价的预测力更高"
+                        f"（平均 R² = {best_a['R²均值']:.4f}），"
+                        f"说明 **预期是领先指标**。"
+                    )
+                else:
+                    conclusion = (
+                        f"方向 B 更强：股价变化对未来 **{int(best_b['前瞻周数'])} 周** 预期变化的预测力更高"
+                        f"（平均 R² = {best_b['R²均值']:.4f}），"
+                        f"说明 **股价是领先指标**。"
+                    )
+                st.info(conclusion)
+
+            # ── 2B: 事件研究 ──
+            st.markdown("#### 📊 事件研究：预期大幅调整前后的股价反应")
+            st.caption("超额收益 = 个股收益 − 等权市场平均收益 | 事件定义：ΔF 处于历史 90%/10% 分位")
+
+            if event_agg.empty:
+                st.warning("事件研究数据不足。")
+            else:
+                # Plotly CAR 曲线
+                fig_car = go.Figure()
+                fig_car.add_trace(go.Scatter(
+                    x=event_agg["week"],
+                    y=event_agg["up_mean"],
+                    name="大幅上调",
+                    mode="lines+markers",
+                    line=dict(color="#2ecc71", width=2),
+                    marker=dict(size=8),
+                ))
+                fig_car.add_trace(go.Scatter(
+                    x=event_agg["week"],
+                    y=event_agg["down_mean"],
+                    name="大幅下调",
+                    mode="lines+markers",
+                    line=dict(color="#e74c3c", width=2),
+                    marker=dict(size=8),
+                ))
+                fig_car.add_hline(y=0, line_dash="dash", line_color="black")
+                fig_car.add_vline(x=0, line_dash="dot", line_color="gray", annotation_text="事件日")
+                fig_car.update_layout(
+                    title="累计超额收益（CAR）：预期大幅调整前后",
+                    xaxis_title="事件窗口（周）",
+                    yaxis_title="累计超额收益",
+                    height=450,
+                    hovermode="x unified",
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+                )
+                st.plotly_chart(fig_car, use_container_width=True)
+
+                # 统计表格
+                tbl_ev = event_agg[["week", "up_mean", "up_t", "up_p", "up_n", "down_mean", "down_t", "down_p", "down_n"]].copy()
+                tbl_ev.columns = [
+                    "周", "上调CAR均值", "上调T", "上调P", "上调N",
+                    "下调CAR均值", "下调T", "下调P", "下调N",
+                ]
+                st.dataframe(tbl_ev.round(3), use_container_width=True, hide_index=True)
+
+                # 关键结论
+                up_event_week = event_agg[event_agg["week"] == 0]
+                if not up_event_week.empty:
+                    up_car = up_event_week.iloc[0]["up_mean"]
+                    up_p = up_event_week.iloc[0]["up_p"]
+                    down_car = up_event_week.iloc[0]["down_mean"]
+                    down_p = up_event_week.iloc[0]["down_p"]
+                    sig_up = "✅ 显著" if up_p < 0.05 else "❌ 不显著"
+                    sig_down = "✅ 显著" if down_p < 0.05 else "❌ 不显著"
+                    st.markdown(
+                        f"**事件当周**：上调事件 CAR = {up_car:.3f}（{sig_up}，p={up_p:.3f}）| "
+                        f"下调事件 CAR = {down_car:.3f}（{sig_down}，p={down_p:.3f}）"
+                    )
 
 
 # ============== Tab: 个股详情 (plotly 交互式) ==============
