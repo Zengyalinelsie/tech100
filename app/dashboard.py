@@ -15,8 +15,14 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
-# 中文字体设置（macOS）
-plt.rcParams["font.sans-serif"] = ["Heiti TC", "Arial Unicode MS"]
+# 中文字体设置（兼容 macOS 本地 + Linux 服务器）
+plt.rcParams["font.sans-serif"] = [
+    "Heiti TC",
+    "Arial Unicode MS",
+    "Noto Sans CJK SC",
+    "WenQuanYi Micro Hei",
+    "DejaVu Sans",
+]
 plt.rcParams["axes.unicode_minus"] = False
 
 ROOT = Path(__file__).parent.parent.resolve()
