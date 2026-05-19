@@ -149,7 +149,6 @@ def compute_all_cross_correlations(weekly_df: pd.DataFrame, max_lag: int = 8):
                     "lag": lag,
                     "t_stat": tstat,
                     "t_pval": tpval,
-                    "n": len(pearsons),
                 }
             )
     ttest_df = pd.DataFrame(ttests)

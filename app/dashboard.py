@@ -279,14 +279,14 @@ with tab_leadlag:
 
             st.info(f"📊 结论：{lead_text}（平均相关系数 = {best_corr:.3f}）")
 
-            # 交叉相关图
+            # 交叉相关图（截面平均）
             fig1, ax1 = plt.subplots(figsize=(10, 5), dpi=150)
             colors = ["#2ecc71" if c > 0 else "#e74c3c" for c in agg["mean_pearson"]]
             ax1.bar(agg["lag"], agg["mean_pearson"], color=colors, alpha=0.7)
             ax1.axhline(y=0, color="black", linewidth=0.8)
             ax1.set_xlabel("Lag (周)", fontsize=11)
             ax1.set_ylabel("平均 Pearson 相关系数", fontsize=11)
-            ax1.set_title("交叉相关图：盈利预期变化 vs 股价收益率", fontsize=13, fontweight="bold")
+            ax1.set_title("交叉相关图（截面平均）：盈利预期变化 vs 股价收益率", fontsize=13, fontweight="bold")
             ax1.set_xticks(agg["lag"])
             ax1.grid(True, alpha=0.3)
             st.pyplot(fig1)
@@ -318,6 +318,68 @@ with tab_leadlag:
                 c1.metric("股价领先预期", f"{n_price_lead} 只", f"{n_price_lead / total * 100:.1f}%")
                 c2.metric("预期领先股价", f"{n_expect_lead} 只", f"{n_expect_lead / total * 100:.1f}%")
                 c3.metric("基本同步", f"{n_sync} 只", f"{n_sync / total * 100:.1f}%")
+
+            # ── 交互式：单只股票交叉相关 ──
+            st.divider()
+            st.subheader("🔍 单只股票交叉相关分析（交互式）")
+
+            # 取有结果的股票列表
+            available_codes = sorted(stock_best["wind_code"].unique()) if not stock_best.empty else []
+            if available_codes:
+                # 用 name + code 组合显示
+                name_map = dict(zip(codes_names_df["wind_code"], codes_names_df["name"]))
+                display_options = [f"{name_map.get(c, c)} ({c})" for c in available_codes]
+                selected_display = st.selectbox("选择股票", display_options, index=0)
+                selected_code_ll = selected_display.split("(")[-1].rstrip(")")
+
+                # 从 stock_best 取该股票的最优 lag
+                sb = stock_best[stock_best["wind_code"] == selected_code_ll]
+                if not sb.empty:
+                    best_lag_stock = int(sb.iloc[0]["best_lag"])
+                    best_corr_stock = sb.iloc[0]["best_corr"]
+                    st.markdown(
+                        f"**{name_map.get(selected_code_ll, selected_code_ll)}**："
+                        f"最优 lag = **{best_lag_stock} 周**，"
+                        f"相关系数 = **{best_corr_stock:.3f}**"
+                    )
+
+                # 用 Plotly 画该股票的交叉相关柱状图
+                # 需要从 df_raw 中筛选（但之前用 _ 丢弃了），重新计算单只
+                from leadlag_analysis import prepare_stock_series, cross_correlation_series
+
+                sub_hist = prepare_stock_series(hist_df, selected_code_ll)
+                single_corr = cross_correlation_series(sub_hist["delta_f"], sub_hist["return_r"], max_lag=8)
+                if single_corr:
+                    lags_s = sorted(single_corr.keys())
+                    pearsons_s = [single_corr[l]["pearson_r"] for l in lags_s]
+                    spearmans_s = [single_corr[l]["spearman_r"] for l in lags_s]
+
+                    fig3 = go.Figure()
+                    fig3.add_trace(go.Bar(
+                        x=lags_s,
+                        y=pearsons_s,
+                        name="Pearson",
+                        marker_color=["#2ecc71" if v > 0 else "#e74c3c" for v in pearsons_s],
+                        opacity=0.8,
+                    ))
+                    fig3.add_trace(go.Scatter(
+                        x=lags_s,
+                        y=spearmans_s,
+                        name="Spearman",
+                        mode="lines+markers",
+                        line=dict(color="#3498db", width=2),
+                        marker=dict(size=8),
+                    ))
+                    fig3.add_hline(y=0, line_dash="dash", line_color="black")
+                    fig3.update_layout(
+                        title=f"{name_map.get(selected_code_ll, selected_code_ll)} 的交叉相关图",
+                        xaxis_title="Lag (周)",
+                        yaxis_title="相关系数",
+                        height=400,
+                        hovermode="x unified",
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+                    )
+                    st.plotly_chart(fig3, use_container_width=True)
 
 
 # ============== Tab: 个股详情 (plotly 交互式) ==============
