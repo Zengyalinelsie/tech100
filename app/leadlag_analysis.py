@@ -334,3 +334,145 @@ def build_event_study(
     agg = agg.merge(ttest_df, on="week", how="left")
 
     return events_df, agg
+
+
+# ==================== Layer 3: 状态依赖 + VAR + IRF ====================
+
+def state_dependent_cross_correlation(
+    weekly_df: pd.DataFrame, static_df: pd.DataFrame | None = None, max_lag: int = 8
+):
+    """
+    按市场状态（牛市/熊市）和机构覆盖度分组计算交叉相关。
+    """
+    # 1. 计算市场状态：等权指数 vs 20周均线
+    index_df = weekly_df.groupby("trade_date")["close_hkd"].mean().reset_index()
+    index_df = index_df.sort_values("trade_date").reset_index(drop=True)
+    index_df["index_ma20"] = index_df["close_hkd"].rolling(window=20, min_periods=10).mean()
+    index_df["bull"] = index_df["close_hkd"] > index_df["index_ma20"]
+    index_df["bull"] = index_df["bull"].fillna(False)
+
+    weekly_df = weekly_df.merge(index_df[["trade_date", "bull"]], on="trade_date", how="left")
+
+    # 2. 合并机构覆盖度（取最新 static）
+    if (
+        static_df is not None
+        and not static_df.empty
+        and "inst_num_2025" in static_df.columns
+    ):
+        latest_static = (
+            static_df.sort_values("update_date").groupby("wind_code").last().reset_index()
+        )
+        weekly_df = weekly_df.merge(
+            latest_static[["wind_code", "inst_num_2025"]],
+            on="wind_code",
+            how="left",
+        )
+        weekly_df["inst_num_2025"] = pd.to_numeric(
+            weekly_df["inst_num_2025"], errors="coerce"
+        )
+        median_inst = weekly_df["inst_num_2025"].median()
+        if pd.isna(median_inst) or median_inst == 0:
+            # 机构数据无效，用代码排序做代理分组
+            codes = sorted(weekly_df["wind_code"].unique())
+            mid = len(codes) // 2
+            high_codes = set(codes[mid:])
+            weekly_df["high_coverage"] = weekly_df["wind_code"].isin(high_codes)
+        else:
+            weekly_df["high_coverage"] = weekly_df["inst_num_2025"] > median_inst
+    else:
+        codes = sorted(weekly_df["wind_code"].unique())
+        mid = len(codes) // 2
+        high_codes = set(codes[mid:])
+        weekly_df["high_coverage"] = weekly_df["wind_code"].isin(high_codes)
+
+    # 3. 分组计算
+    groups = {
+        "牛市": weekly_df[weekly_df["bull"] == True],
+        "熊市": weekly_df[weekly_df["bull"] == False],
+        "高覆盖": weekly_df[weekly_df["high_coverage"] == True],
+        "低覆盖": weekly_df[weekly_df["high_coverage"] == False],
+    }
+
+    results = {}
+    for name, grp in groups.items():
+        if len(grp) > 0:
+            agg, _, _ = compute_all_cross_correlations(grp, max_lag)
+            if not agg.empty:
+                results[name] = agg
+
+    return results
+
+
+def var_granger_irf(weekly_df: pd.DataFrame, max_lag: int = 8, irf_periods: int = 12):
+    """
+    对截面平均的双变量时间序列拟合 VAR，输出格兰杰因果 + IRF。
+    """
+    from statsmodels.tsa.api import VAR
+
+    codes = sorted(weekly_df["wind_code"].unique())
+    panel = {}
+
+    for code in codes:
+        sub = prepare_stock_series(weekly_df, code)
+        if len(sub) < 30:  # 至少30周才纳入
+            continue
+        sub = sub.set_index("trade_date")
+        panel[code] = sub
+
+    if not panel:
+        return None, None, None
+
+    # 宽格式面板：每周截面平均（不截断，各股票用各自完整序列）
+    panel_df = pd.concat(panel, axis=1)
+    delta_f_avg = panel_df.xs("delta_f", level=1, axis=1).mean(axis=1, skipna=True)
+    return_r_avg = panel_df.xs("return_r", level=1, axis=1).mean(axis=1, skipna=True)
+
+    var_data = pd.DataFrame({
+        "delta_f": delta_f_avg,
+        "return_r": return_r_avg,
+    }).dropna()
+
+    if len(var_data) < max_lag * 2 + 10:
+        return None, None, None
+
+    model = VAR(var_data)
+    try:
+        actual_max_lag = min(max_lag, len(var_data) // 3)
+        if actual_max_lag < 1:
+            return None, None, None
+        results = model.fit(maxlags=actual_max_lag, ic="aic")
+    except Exception:
+        return None, None, None
+
+    # 格兰杰因果检验
+    gc_f_to_r = results.test_causality("return_r", "delta_f", kind="f")
+    gc_r_to_f = results.test_causality("delta_f", "return_r", kind="f")
+
+    gc = {
+        "f_to_r": {
+            "stat": float(gc_f_to_r.test_statistic),
+            "pvalue": float(gc_f_to_r.pvalue),
+            "sig": float(gc_f_to_r.pvalue) < 0.05,
+        },
+        "r_to_f": {
+            "stat": float(gc_r_to_f.test_statistic),
+            "pvalue": float(gc_r_to_f.pvalue),
+            "sig": float(gc_r_to_f.pvalue) < 0.05,
+        },
+    }
+
+    # 脉冲响应函数
+    irf = results.irf(irf_periods)
+    irf_data = {
+        "periods": list(range(irf_periods + 1)),
+        # delta_f 冲击 → return_r 响应
+        "df_to_r": irf.irfs[:, 1, 0].tolist(),
+        "df_to_r_lower": (irf.irfs[:, 1, 0] - 1.96 * irf.stderr()[:, 1, 0]).tolist(),
+        "df_to_r_upper": (irf.irfs[:, 1, 0] + 1.96 * irf.stderr()[:, 1, 0]).tolist(),
+        # return_r 冲击 → delta_f 响应
+        "r_to_df": irf.irfs[:, 0, 1].tolist(),
+        "r_to_df_lower": (irf.irfs[:, 0, 1] - 1.96 * irf.stderr()[:, 0, 1]).tolist(),
+        "r_to_df_upper": (irf.irfs[:, 0, 1] + 1.96 * irf.stderr()[:, 0, 1]).tolist(),
+    }
+
+    return results, gc, irf_data

@@ -516,6 +516,140 @@ with tab_leadlag:
                         f"下调事件 CAR = {down_car:.3f}（{sig_down}，p={down_p:.3f}）"
                     )
 
+            # ── Layer 3: 状态依赖 + VAR + IRF ──
+            st.divider()
+            st.subheader("Layer 3：在什么条件下成立？顶级量化框架")
+
+            with st.spinner("正在计算状态依赖分析与 VAR 模型（约需 15–30 秒）……"):
+                from leadlag_analysis import state_dependent_cross_correlation, var_granger_irf
+
+                state_results = state_dependent_cross_correlation(hist_df, static_df, max_lag=8)
+                var_results, gc, irf_data = var_granger_irf(hist_df, max_lag=8, irf_periods=12)
+
+            # ── 3A: 状态依赖分析 ──
+            st.markdown("#### 📊 状态依赖：不同市场状态下的领先-滞后关系")
+            st.caption("左列=市场状态（牛市/熊市） | 右列=覆盖度分组（高/低）")
+
+            if state_results:
+                c1, c2 = st.columns(2)
+                state_names = list(state_results.keys())
+                for i, name in enumerate(state_names):
+                    agg_state = state_results[name]
+                    if agg_state.empty:
+                        continue
+                    fig_s, ax_s = plt.subplots(figsize=(8, 4), dpi=150)
+                    colors = ["#2ecc71" if c > 0 else "#e74c3c" for c in agg_state["mean_pearson"]]
+                    ax_s.bar(agg_state["lag"], agg_state["mean_pearson"], color=colors, alpha=0.7)
+                    ax_s.axhline(y=0, color="black", linewidth=0.8)
+                    ax_s.set_xlabel("Lag (周)", fontsize=10)
+                    ax_s.set_ylabel("平均 Pearson r", fontsize=10)
+                    ax_s.set_title(f"{name}", fontsize=12, fontweight="bold")
+                    ax_s.set_xticks(agg_state["lag"])
+                    ax_s.grid(True, alpha=0.3)
+                    if i % 2 == 0:
+                        c1.pyplot(fig_s)
+                    else:
+                        c2.pyplot(fig_s)
+
+                # 状态对比结论
+                if "牛市" in state_results and "熊市" in state_results:
+                    bull_best = state_results["牛市"].loc[state_results["牛市"]["mean_pearson"].abs().idxmax()]
+                    bear_best = state_results["熊市"].loc[state_results["熊市"]["mean_pearson"].abs().idxmax()]
+                    st.info(
+                        f"牛市最优：lag={int(bull_best['lag'])}, r={bull_best['mean_pearson']:.3f} | "
+                        f"熊市最优：lag={int(bear_best['lag'])}, r={bear_best['mean_pearson']:.3f}"
+                    )
+            else:
+                st.warning("状态依赖分析数据不足。")
+
+            # ── 3B: VAR + 格兰杰因果 ──
+            st.markdown("#### 🔬 VAR 模型 + 格兰杰因果检验")
+
+            if gc:
+                gc_cols = st.columns(2)
+                with gc_cols[0]:
+                    st.metric(
+                        "预期 → 股价",
+                        f"F = {gc['f_to_r']['stat']:.3f}",
+                        f"p = {gc['f_to_r']['pvalue']:.3f} {'✅ 显著' if gc['f_to_r']['sig'] else '❌ 不显著'}",
+                    )
+                with gc_cols[1]:
+                    st.metric(
+                        "股价 → 预期",
+                        f"F = {gc['r_to_f']['stat']:.3f}",
+                        f"p = {gc['r_to_f']['pvalue']:.3f} {'✅ 显著' if gc['r_to_f']['sig'] else '❌ 不显著'}",
+                    )
+
+                if gc["f_to_r"]["sig"] or gc["r_to_f"]["sig"]:
+                    direction = []
+                    if gc["f_to_r"]["sig"]:
+                        direction.append("预期变化**格兰杰引起**股价变化")
+                    if gc["r_to_f"]["sig"]:
+                        direction.append("股价变化**格兰杰引起**预期变化")
+                    st.success(" → ".join(direction))
+                else:
+                    st.warning("两个方向均未通过格兰杰因果检验：价格和预期之间不存在统计上可识别的领先-滞后因果关系。")
+            else:
+                st.warning("VAR 模型拟合失败（样本量不足）。")
+
+            # ── 3C: 脉冲响应函数（IRF）──
+            st.markdown("#### 🎯 脉冲响应函数（IRF）")
+            st.caption("一个标准差冲击后，另一变量的动态反应路径（95% 置信区间）")
+
+            if irf_data:
+                irf_c1, irf_c2 = st.columns(2)
+
+                with irf_c1:
+                    fig_irf1 = go.Figure()
+                    periods = irf_data["periods"]
+                    fig_irf1.add_trace(go.Scatter(
+                        x=periods, y=irf_data["df_to_r"],
+                        name="点估计", mode="lines+markers",
+                        line=dict(color="#1f77b4", width=2),
+                    ))
+                    fig_irf1.add_trace(go.Scatter(
+                        x=periods + periods[::-1],
+                        y=irf_data["df_to_r_upper"] + irf_data["df_to_r_lower"][::-1],
+                        fill="toself", fillcolor="rgba(31,119,180,0.2)",
+                        line=dict(color="rgba(255,255,255,0)"),
+                        name="95% CI", showlegend=True,
+                    ))
+                    fig_irf1.add_hline(y=0, line_dash="dash", line_color="black")
+                    fig_irf1.update_layout(
+                        title="预期冲击 → 股价响应",
+                        xaxis_title="期数（周）",
+                        yaxis_title="响应幅度",
+                        height=350,
+                        hovermode="x unified",
+                    )
+                    st.plotly_chart(fig_irf1, use_container_width=True)
+
+                with irf_c2:
+                    fig_irf2 = go.Figure()
+                    fig_irf2.add_trace(go.Scatter(
+                        x=periods, y=irf_data["r_to_df"],
+                        name="点估计", mode="lines+markers",
+                        line=dict(color="#ff7f0e", width=2),
+                    ))
+                    fig_irf2.add_trace(go.Scatter(
+                        x=periods + periods[::-1],
+                        y=irf_data["r_to_df_upper"] + irf_data["r_to_df_lower"][::-1],
+                        fill="toself", fillcolor="rgba(255,127,14,0.2)",
+                        line=dict(color="rgba(255,255,255,0)"),
+                        name="95% CI", showlegend=True,
+                    ))
+                    fig_irf2.add_hline(y=0, line_dash="dash", line_color="black")
+                    fig_irf2.update_layout(
+                        title="股价冲击 → 预期响应",
+                        xaxis_title="期数（周）",
+                        yaxis_title="响应幅度",
+                        height=350,
+                        hovermode="x unified",
+                    )
+                    st.plotly_chart(fig_irf2, use_container_width=True)
+            else:
+                st.warning("IRF 数据不可用。")
+
 
 # ============== Tab: 个股详情 (plotly 交互式) ==============
 if tab_detail is not None:
