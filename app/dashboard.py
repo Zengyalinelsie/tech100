@@ -10,16 +10,26 @@ from io import StringIO
 from pathlib import Path
 
 import pandas as pd
+import matplotlib
 import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
+
+# Streamlit Cloud 上中文字体是在 packages.txt 阶段后安装的，
+# matplotlib 的字体缓存可能不包含它们，需要强制重新扫描。
+try:
+    fm._load_fontmanager(try_read_cache=False)
+except Exception:
+    pass
 
 # 中文字体设置（兼容 macOS 本地 + Linux 服务器）
 plt.rcParams["font.sans-serif"] = [
     "Heiti TC",
     "Arial Unicode MS",
     "Noto Sans CJK SC",
+    "WenQuanYi Zen Hei",
     "WenQuanYi Micro Hei",
     "DejaVu Sans",
 ]
