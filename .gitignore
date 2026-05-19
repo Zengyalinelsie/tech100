@@ -9,7 +9,8 @@ dist/
 build/
 
 # Data & Logs
-data/*.db
+# Keep wind_history.db for Streamlit Cloud, exclude backups only
+data/*.backup.db
 logs/*.log
 logs/*.csv
 
