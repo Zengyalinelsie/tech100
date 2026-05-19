@@ -17,6 +17,8 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
+from leadlag_analysis import compute_all_cross_correlations, build_event_study
+
 # Streamlit Cloud 上中文字体是在 packages.txt 阶段后安装的，
 # matplotlib 的字体缓存可能不包含它们，需要强制重新扫描。
 try:
@@ -77,6 +79,22 @@ def get_weekly_data(update_date):
            FROM weekly_data WHERE update_date = ? ORDER BY wind_code, trade_date""",
         conn,
         params=(update_date,),
+    )
+    conn.close()
+    df["trade_date"] = pd.to_datetime(df["trade_date"])
+    df["netprofit_avg"] = pd.to_numeric(df["netprofit_avg"], errors="coerce")
+    df["close_hkd"] = pd.to_numeric(df["close_hkd"], errors="coerce")
+    return df
+
+
+@st.cache_data(ttl=3600)
+def get_all_historical_weekly():
+    """读取全量历史 weekly 数据（用于时间差分析）。"""
+    conn = get_conn()
+    df = pd.read_sql_query(
+        """SELECT trade_date, wind_code, name, netprofit_avg, close_hkd
+           FROM weekly_data ORDER BY wind_code, trade_date""",
+        conn,
     )
     conn.close()
     df["trade_date"] = pd.to_datetime(df["trade_date"])
@@ -149,12 +167,12 @@ st.caption(f"数据日期：{selected_date}")
 
 # ============== Tab 路由 ==============
 if filter_mode == "全部 100 只":
-    tabs = st.tabs(["📈 100只概览", "📋 静态指标"])
-    tab_overview, tab_static = tabs
+    tabs = st.tabs(["📈 100只概览", "⏱️ 时间差分析", "📋 静态指标"])
+    tab_overview, tab_leadlag, tab_static = tabs
     tab_detail = None
 else:
-    tabs = st.tabs(["🔍 个股详情", "📈 100只概览", "📋 静态指标"])
-    tab_detail, tab_overview, tab_static = tabs
+    tabs = st.tabs(["🔍 个股详情", "📈 100只概览", "⏱️ 时间差分析", "📋 静态指标"])
+    tab_detail, tab_overview, tab_leadlag, tab_static = tabs
 
 
 # ============== 缓存渲染 100只概览 ==============
@@ -229,6 +247,77 @@ with tab_overview:
         # 用 JSON 串作为缓存 key（比直接传 DataFrame 更稳定）
         png_bytes = render_overview_png(weekly_df.to_json(orient="split", date_format="iso"), selected_date)
         st.image(png_bytes, use_container_width=True)
+
+
+# ============== Tab: 时间差分析 (Layer 1) ==============
+with tab_leadlag:
+    st.subheader("Layer 1：谁领先谁？领先多久？")
+    st.caption("k > 0：预期领先股价 | k < 0：股价领先预期 | k = 0：基本同步")
+
+    hist_df = get_all_historical_weekly()
+    if hist_df.empty:
+        st.warning("暂无历史数据。")
+    else:
+        with st.spinner("正在计算交叉相关（约需 10–20 秒）……"):
+            agg, stock_best, _ = compute_all_cross_correlations(hist_df, max_lag=8)
+
+        if agg.empty:
+            st.warning("数据不足以计算交叉相关。")
+        else:
+            # 结论卡片
+            best_idx = agg["mean_pearson"].abs().idxmax()
+            best_row = agg.loc[best_idx]
+            best_lag = int(best_row["lag"])
+            best_corr = best_row["mean_pearson"]
+
+            if best_lag > 0:
+                lead_text = f"预期平均领先股价 **{best_lag} 周**"
+            elif best_lag < 0:
+                lead_text = f"股价平均领先预期 **{abs(best_lag)} 周**"
+            else:
+                lead_text = "预期与股价基本同步"
+
+            st.info(f"📊 结论：{lead_text}（平均相关系数 = {best_corr:.3f}）")
+
+            # 交叉相关图
+            fig1, ax1 = plt.subplots(figsize=(10, 5), dpi=150)
+            colors = ["#2ecc71" if c > 0 else "#e74c3c" for c in agg["mean_pearson"]]
+            ax1.bar(agg["lag"], agg["mean_pearson"], color=colors, alpha=0.7)
+            ax1.axhline(y=0, color="black", linewidth=0.8)
+            ax1.set_xlabel("Lag (周)", fontsize=11)
+            ax1.set_ylabel("平均 Pearson 相关系数", fontsize=11)
+            ax1.set_title("交叉相关图：盈利预期变化 vs 股价收益率", fontsize=13, fontweight="bold")
+            ax1.set_xticks(agg["lag"])
+            ax1.grid(True, alpha=0.3)
+            st.pyplot(fig1)
+
+            # 统计表格
+            tbl = agg.copy()
+            tbl.columns = ["Lag(周)", "Pearson均值", "Pearson标准差", "Spearman均值", "Spearman标准差", "股票数", "T统计量", "P值"]
+            st.dataframe(tbl.round(3), use_container_width=True, hide_index=True)
+
+            # 个股最优 lag 分布
+            if not stock_best.empty:
+                st.subheader("个股层面的领先-滞后分布")
+                fig2, ax2 = plt.subplots(figsize=(10, 4), dpi=150)
+                lag_counts = stock_best["best_lag"].value_counts().sort_index()
+                bar_colors = ["#e74c3c" if l < 0 else "#3498db" if l > 0 else "#95a5a6" for l in lag_counts.index]
+                ax2.bar(lag_counts.index.astype(str), lag_counts.values, color=bar_colors, alpha=0.7)
+                ax2.set_xlabel("最优 Lag (周)", fontsize=11)
+                ax2.set_ylabel("股票数量", fontsize=11)
+                ax2.set_title("每只股票的最优领先/滞后周数分布", fontsize=13, fontweight="bold")
+                ax2.grid(True, alpha=0.3)
+                st.pyplot(fig2)
+
+                n_price_lead = int((stock_best["best_lag"] < 0).sum())
+                n_expect_lead = int((stock_best["best_lag"] > 0).sum())
+                n_sync = int((stock_best["best_lag"] == 0).sum())
+                total = len(stock_best)
+
+                c1, c2, c3 = st.columns(3)
+                c1.metric("股价领先预期", f"{n_price_lead} 只", f"{n_price_lead / total * 100:.1f}%")
+                c2.metric("预期领先股价", f"{n_expect_lead} 只", f"{n_expect_lead / total * 100:.1f}%")
+                c3.metric("基本同步", f"{n_sync} 只", f"{n_sync / total * 100:.1f}%")
 
 
 # ============== Tab: 个股详情 (plotly 交互式) ==============
