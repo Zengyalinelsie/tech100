@@ -193,30 +193,30 @@ display_options = [f"{name} ({code})" for code, name in zip(all_codes, all_names
 st.sidebar.markdown("**选择股票**")
 search = st.sidebar.text_input(
     "选择股票",
-    placeholder="输入名称或代码，例如：腾讯、700",
+    value="",
     label_visibility="collapsed",
     key="stock_search",
 )
 
-if not search.strip():
-    selected_display = ALL_TAG
-    st.sidebar.caption(f"当前：{ALL_TAG}（共 {len(display_options)} 只）")
-else:
+if search.strip():
     s = search.strip().lower()
-    matches = [o for o in display_options if s in o.lower()]
-    if len(matches) == 0:
+    filtered = [o for o in display_options if s in o.lower()]
+    if not filtered:
         st.sidebar.warning(f"未找到匹配「{search}」的股票")
-        selected_display = ALL_TAG
-    elif len(matches) == 1:
-        selected_display = matches[0]
-        st.sidebar.caption(f"✓ {matches[0]}")
-    else:
-        selected_display = st.sidebar.selectbox(
-            f"匹配 {len(matches)} 项",
-            matches, index=0,
-            label_visibility="collapsed",
-            key="stock_pick",
-        )
+        filtered = display_options
+else:
+    filtered = display_options
+
+options_full = [ALL_TAG] + filtered
+
+selected_display = st.sidebar.selectbox(
+    "股票列表",
+    options_full,
+    index=0,
+    label_visibility="collapsed",
+    key="stock_pick",
+)
+st.sidebar.caption(f"共 {len(filtered)} 只可选")
 
 if selected_display == ALL_TAG:
     selected_code, selected_name = None, None
@@ -298,11 +298,8 @@ tab_market, tab_stock, tab_rank = st.tabs([
 PER_PAGE = 12  # 每页 12 只（3 行 × 4 列）
 
 
-# ============== 缓存渲染：成分股全景 PNG（分页） ==============
-@st.cache_data(ttl=3600)
-def render_overview_png(weekly_json: str, date_str: str, page: int, per_page: int) -> bytes:
-    weekly_df = pd.read_json(StringIO(weekly_json), orient="split")
-    weekly_df["trade_date"] = pd.to_datetime(weekly_df["trade_date"])
+# ============== 渲染：成分股全景 Plotly 交互（分页） ==============
+def render_overview_plotly(weekly_df: pd.DataFrame, page: int, per_page: int):
     grouped = weekly_df.groupby("wind_code")
     all_codes = sorted(weekly_df["wind_code"].unique())
 
@@ -313,50 +310,76 @@ def render_overview_png(weekly_json: str, date_str: str, page: int, per_page: in
     n_cols = 4
     n_rows = (len(codes) + n_cols - 1) // n_cols if codes else 1
 
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(26, 4.6 * n_rows), dpi=180, squeeze=False)
-    fig.patch.set_facecolor("white")
+    specs = [[{"secondary_y": True}] * n_cols for _ in range(n_rows)]
+    titles = []
+    for c in codes:
+        sub = grouped.get_group(c)
+        name = sub["name"].iloc[0] if not sub["name"].isna().all() else c
+        titles.append(f"{name} · {c}")
+
+    fig = make_subplots(
+        rows=n_rows, cols=n_cols, specs=specs, subplot_titles=titles,
+        vertical_spacing=0.14, horizontal_spacing=0.07,
+    )
 
     for idx, code in enumerate(codes):
-        row = idx // n_cols
-        col = idx % n_cols
-        ax = axes[row][col]
-
+        r = idx // n_cols + 1
+        c = idx % n_cols + 1
         sub = grouped.get_group(code).sort_values("trade_date")
-        name = sub["name"].iloc[0] if not sub["name"].isna().all() else code
 
-        ax.plot(sub["trade_date"], sub["netprofit_avg"], color=PALETTE["forecast"], linewidth=2.0, label="预测净利润")
-        ax.set_ylabel("净利润(百万)", color=PALETTE["forecast"], fontsize=12)
-        ax.tick_params(axis="y", labelcolor=PALETTE["forecast"], labelsize=11)
+        fig.add_trace(
+            go.Scatter(
+                x=sub["trade_date"], y=sub["netprofit_avg"],
+                mode="lines",
+                line=dict(color=PALETTE["forecast"], width=2),
+                name="预测净利润",
+                legendgroup="forecast",
+                showlegend=(idx == 0),
+                hovertemplate="%{x|%Y-%m-%d}<br>净利润 %{y:,.0f} 百万<extra></extra>",
+            ),
+            row=r, col=c, secondary_y=False,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=sub["trade_date"], y=sub["close_hkd"],
+                mode="lines",
+                line=dict(color=PALETTE["price"], width=2, dash="dash"),
+                name="股价",
+                legendgroup="price",
+                showlegend=(idx == 0),
+                hovertemplate="%{x|%Y-%m-%d}<br>股价 %{y:.2f} HKD<extra></extra>",
+            ),
+            row=r, col=c, secondary_y=True,
+        )
 
-        ax2 = ax.twinx()
-        ax2.plot(sub["trade_date"], sub["close_hkd"], color=PALETTE["price"], linewidth=2.0, linestyle="--", label="股价")
-        ax2.set_ylabel("股价(HKD)", color=PALETTE["price"], fontsize=12)
-        ax2.tick_params(axis="y", labelcolor=PALETTE["price"], labelsize=11)
-
-        ax.set_title(f"{name}  {code}", fontsize=15, fontweight="bold", color=PALETTE["title"], pad=8)
-
-        n_ticks = min(4, len(sub))
-        if n_ticks > 0:
-            step = max(1, len(sub) // n_ticks)
-            tick_positions = sub["trade_date"].iloc[::step]
-            ax.set_xticks(tick_positions)
-            ax.set_xticklabels(
-                [d.strftime("%Y-%m") for d in tick_positions],
-                rotation=30, ha="right", fontsize=11,
-            )
-
-        ax.grid(True, alpha=0.3, linestyle=":")
-
-    for idx in range(len(codes), n_rows * n_cols):
-        row = idx // n_cols
-        col = idx % n_cols
-        axes[row][col].axis("off")
-
-    plt.tight_layout(pad=2.0)
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight", facecolor="white")
-    plt.close(fig)
-    return buf.getvalue()
+    fig.update_xaxes(
+        tickfont=dict(color=PALETTE["axis"], size=11),
+        gridcolor="#E5E5E5", showgrid=True,
+    )
+    fig.update_yaxes(
+        tickfont=dict(color=PALETTE["axis"], size=11),
+        gridcolor="#E5E5E5", showgrid=True,
+        secondary_y=False,
+    )
+    fig.update_yaxes(
+        tickfont=dict(color=PALETTE["axis"], size=11),
+        showgrid=False,
+        secondary_y=True,
+    )
+    fig.update_annotations(font=dict(size=13, color=PALETTE["title"]))
+    fig.update_layout(
+        height=380 * n_rows,
+        hovermode="x unified",
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        font=dict(family="PingFang SC, Helvetica, Arial", size=12, color=PALETTE["axis"]),
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5,
+            font=dict(color=PALETTE["axis"], size=12),
+        ),
+        margin=dict(l=40, r=20, t=80, b=40),
+    )
+    return fig
 
 
 # ============================================================
@@ -408,11 +431,8 @@ with tab_market:
         end = min(start + PER_PAGE, len(codes))
         pc2.markdown(f"<div style='padding-top:30px;color:#666'>显示第 {start + 1} – {end} 只</div>", unsafe_allow_html=True)
 
-        png_bytes = render_overview_png(
-            weekly_df.to_json(orient="split", date_format="iso"),
-            selected_date, int(page) - 1, PER_PAGE,
-        )
-        st.image(png_bytes, width="stretch")
+        fig_overview = render_overview_plotly(weekly_df, int(page) - 1, PER_PAGE)
+        st.plotly_chart(fig_overview, width="stretch")
 
     if analysis is None:
         st.warning("暂无历史数据可供时序分析。")
@@ -448,10 +468,11 @@ with tab_market:
 
             fig1, ax1 = plt.subplots(figsize=(10, 5), dpi=150)
             ax1.bar(agg["lag"], agg["mean_pearson"], color=bar_color(agg["mean_pearson"]), alpha=0.85)
-            ax1.axhline(y=0, color="black", linewidth=0.8)
-            ax1.set_xlabel("Lag (周)", fontsize=11)
-            ax1.set_ylabel("平均 Pearson 相关系数", fontsize=11)
-            ax1.set_title("交叉相关图（截面平均）", fontsize=13, fontweight="bold", color=PALETTE["title"])
+            ax1.axhline(y=0, color=PALETTE["axis"], linewidth=0.8)
+            ax1.set_xlabel("Lag (周)", fontsize=12, color=PALETTE["axis"])
+            ax1.set_ylabel("平均 Pearson 相关系数", fontsize=12, color=PALETTE["axis"])
+            ax1.set_title("交叉相关图（截面平均）", fontsize=14, fontweight="bold", color=PALETTE["title"])
+            ax1.tick_params(axis="both", labelcolor=PALETTE["axis"], labelsize=11)
             ax1.set_xticks(agg["lag"])
             ax1.grid(True, alpha=0.3)
             st.pyplot(fig1)
@@ -468,9 +489,10 @@ with tab_market:
                     lag_counts.index.astype(str), lag_counts.values,
                     color=lag_color(lag_counts.index.tolist()), alpha=0.85,
                 )
-                ax2.set_xlabel("最优 Lag (周)", fontsize=11)
-                ax2.set_ylabel("股票数量", fontsize=11)
-                ax2.set_title("每只股票的最优领先/滞后周数分布", fontsize=13, fontweight="bold", color=PALETTE["title"])
+                ax2.set_xlabel("最优 Lag (周)", fontsize=12, color=PALETTE["axis"])
+                ax2.set_ylabel("股票数量", fontsize=12, color=PALETTE["axis"])
+                ax2.set_title("每只股票的最优领先/滞后周数分布", fontsize=14, fontweight="bold", color=PALETTE["title"])
+                ax2.tick_params(axis="both", labelcolor=PALETTE["axis"], labelsize=11)
                 ax2.grid(True, alpha=0.3)
                 st.pyplot(fig2)
 
@@ -609,10 +631,11 @@ with tab_market:
                     agg_state["lag"], agg_state["mean_pearson"],
                     color=bar_color(agg_state["mean_pearson"]), alpha=0.85,
                 )
-                ax_s.axhline(y=0, color="black", linewidth=0.8)
-                ax_s.set_xlabel("Lag (周)", fontsize=10)
-                ax_s.set_ylabel("平均 Pearson r", fontsize=10)
-                ax_s.set_title(name, fontsize=12, fontweight="bold", color=PALETTE["title"])
+                ax_s.axhline(y=0, color=PALETTE["axis"], linewidth=0.8)
+                ax_s.set_xlabel("Lag (周)", fontsize=11, color=PALETTE["axis"])
+                ax_s.set_ylabel("平均 Pearson r", fontsize=11, color=PALETTE["axis"])
+                ax_s.set_title(name, fontsize=13, fontweight="bold", color=PALETTE["title"])
+                ax_s.tick_params(axis="both", labelcolor=PALETTE["axis"], labelsize=10)
                 ax_s.set_xticks(agg_state["lag"])
                 ax_s.grid(True, alpha=0.3)
                 (sc1 if i % 2 == 0 else sc2).pyplot(fig_s)
@@ -672,7 +695,7 @@ with tab_market:
                 fig_irf1.add_trace(go.Scatter(
                     x=periods + periods[::-1],
                     y=irf_data["df_to_r_upper"] + irf_data["df_to_r_lower"][::-1],
-                    fill="toself", fillcolor="rgba(190,184,220,0.35)",
+                    fill="toself", fillcolor="rgba(154,201,219,0.40)",
                     line=dict(color="rgba(255,255,255,0)"),
                     name="95% CI", showlegend=True,
                 ))
@@ -695,7 +718,7 @@ with tab_market:
                 fig_irf2.add_trace(go.Scatter(
                     x=periods + periods[::-1],
                     y=irf_data["r_to_df_upper"] + irf_data["r_to_df_lower"][::-1],
-                    fill="toself", fillcolor="rgba(190,184,220,0.35)",
+                    fill="toself", fillcolor="rgba(154,201,219,0.40)",
                     line=dict(color="rgba(255,255,255,0)"),
                     name="95% CI", showlegend=True,
                 ))
@@ -1001,42 +1024,3 @@ with tab_rank:
                     disp[col] = disp[col].fillna(0).astype(int)
             st.dataframe(disp, width="stretch", hide_index=True)
             st.caption("数据单位：百万元人民币 ｜ 来源：Wind 一致预期")
-
-
-# ============================================================
-# 名词解释面板（全局，置于页面最末）
-# ============================================================
-st.divider()
-with st.expander("📖 名词解释 · lag / CAR / Granger / IRF / R² 的金融含义", expanded=False):
-    st.markdown("""
-#### Lag（滞后期 / 领先期）
-- `k > 0`：盈利预期变化在前，股价反应在后 — **预期是领先指标**
-- `k < 0`：股价变化在前，预期跟随 — **股价是领先指标**（市场已 price in）
-- `k = 0`：两者基本同步
-
-#### CAR（累计超额收益, Cumulative Abnormal Return）
-公式：`CAR_t = Σ (个股收益 − 等权市场平均收益)`
-
-事件研究里画的 CAR 曲线，反映"事件发生前后 t 周，该类事件平均能跑赢/跑输市场多少"。
-事件当周 CAR 显著为正 + 持续累积 → 事件具有交易价值。
-
-#### Granger 因果
-统计意义上的"因果"：`X 格兰杰引起 Y`，意味着 X 的历史信息能显著提升对 Y 未来的预测精度。
-**不是物理因果**，仅说明信息领先关系。p < 0.05 视为显著。
-
-#### IRF（脉冲响应函数, Impulse Response Function）
-"X 受到一个标准差冲击后的若干期内，Y 的动态反应路径。"
-配合 95% 置信区间，能识别冲击的方向、峰值时刻、消退速度。
-
-#### 双向回归 R²
-- 方向 A 的 R² 是 `预期变化 → 未来股价收益` 的回归拟合优度
-- 方向 B 的 R² 是 `股价收益 → 未来预期变化` 的回归拟合优度
-
-对比两个方向的 R² 大小，可判断"谁更能预测谁"。
-
-#### Pearson vs Spearman
-- **Pearson** 衡量**线性**相关
-- **Spearman** 衡量**单调**相关（更稳健于异常值）
-
-两者趋势一致 = 关系稳健；分歧大 = 关系存在非线性或受异常点驱动。
-""")
