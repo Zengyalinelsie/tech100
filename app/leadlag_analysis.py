@@ -476,3 +476,99 @@ def var_granger_irf(weekly_df: pd.DataFrame, max_lag: int = 8, irf_periods: int 
     }
 
     return results, gc, irf_data
+
+
+def build_ranking_df(
+    stock_best: pd.DataFrame,
+    df_a: pd.DataFrame,
+    df_b: pd.DataFrame,
+    events_df: pd.DataFrame,
+    codes_names_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    把四个分析模块的个股结果聚合为单股一行的排行榜。
+    不做任何新的统计计算 —— 仅 groupby / argmax / 末端取值。
+
+    输出列：
+      名称 | 代码 | 最优lag | 相关r | 方向A R² | 方向A 前瞻 |
+      方向B R² | 方向B 前瞻 | 上调CAR | 下调CAR | 主导方向
+    """
+    name_map = dict(zip(codes_names_df["wind_code"], codes_names_df["name"]))
+
+    cols = [
+        "名称", "代码", "最优lag", "相关r",
+        "方向A R²", "方向A 前瞻", "方向B R²", "方向B 前瞻",
+        "上调CAR", "下调CAR", "主导方向",
+    ]
+
+    if stock_best is None or stock_best.empty:
+        return pd.DataFrame(columns=cols)
+
+    # 1) 相关性：取每只股票的最优 lag / 相关系数
+    base = stock_best[["wind_code", "best_lag", "best_corr"]].rename(
+        columns={"best_lag": "最优lag", "best_corr": "相关r"}
+    )
+
+    # 2) 双向回归：按 wind_code 取 R² 最大的那一行（带 lag）
+    def _best_r2(df):
+        if df is None or df.empty:
+            return pd.DataFrame(columns=["wind_code", "r2", "lag"])
+        idx = df.groupby("wind_code")["r_squared"].idxmax()
+        return (
+            df.loc[idx, ["wind_code", "r_squared", "lag"]]
+            .reset_index(drop=True)
+        )
+
+    best_a = _best_r2(df_a).rename(columns={"r_squared": "方向A R²", "lag": "方向A 前瞻"})
+    best_b = _best_r2(df_b).rename(columns={"r_squared": "方向B R²", "lag": "方向B 前瞻"})
+
+    # 3) 事件研究：取每只股票事件窗口末端 CAR 的平均
+    if events_df is not None and not events_df.empty:
+        ev = events_df.copy()
+        ev["car_end"] = ev["car_cumsum"].apply(
+            lambda v: v[-1] if isinstance(v, list) and len(v) > 0 else np.nan
+        )
+        up_car = (
+            ev[ev["event_type"] == "大幅上调"]
+            .groupby("wind_code")["car_end"]
+            .mean()
+            .reset_index()
+            .rename(columns={"car_end": "上调CAR"})
+        )
+        down_car = (
+            ev[ev["event_type"] == "大幅下调"]
+            .groupby("wind_code")["car_end"]
+            .mean()
+            .reset_index()
+            .rename(columns={"car_end": "下调CAR"})
+        )
+    else:
+        up_car = pd.DataFrame(columns=["wind_code", "上调CAR"])
+        down_car = pd.DataFrame(columns=["wind_code", "下调CAR"])
+
+    # 合并
+    out = base.merge(best_a, on="wind_code", how="left") \
+              .merge(best_b, on="wind_code", how="left") \
+              .merge(up_car, on="wind_code", how="left") \
+              .merge(down_car, on="wind_code", how="left")
+
+    out["名称"] = out["wind_code"].map(name_map).fillna(out["wind_code"])
+    out = out.rename(columns={"wind_code": "代码"})
+
+    # 主导方向
+    def _direction(row):
+        a = row.get("方向A R²", np.nan)
+        b = row.get("方向B R²", np.nan)
+        if pd.isna(a) and pd.isna(b):
+            return "—"
+        if pd.isna(a):
+            return "股价→预期"
+        if pd.isna(b):
+            return "预期→股价"
+        if abs(a - b) < 0.01:
+            return "近似同步"
+        return "预期→股价" if a > b else "股价→预期"
+
+    out["主导方向"] = out.apply(_direction, axis=1)
+
+    return out[cols]

@@ -1,5 +1,5 @@
 """
-Streamlit 展示：香港科技100 一致预期 + 股价走势（交互式重构版）
+香港科技 100 · 盈利预期与股价联动看板
 
 启动方式：
     streamlit run app/dashboard.py
@@ -9,8 +9,8 @@ import sqlite3
 from io import StringIO
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
-import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 import plotly.graph_objects as go
@@ -21,30 +21,34 @@ from leadlag_analysis import (
     compute_all_cross_correlations,
     bidirectional_prediction_regression,
     build_event_study,
+    state_dependent_cross_correlation,
+    var_granger_irf,
+    build_ranking_df,
+    prepare_stock_series,
+    cross_correlation_series,
 )
+from theme import PALETTE, PLOTLY_LAYOUT, bar_color, lag_color, CUSTOM_CSS
 
-# Streamlit Cloud 上中文字体是在 packages.txt 阶段后安装的，
-# matplotlib 的字体缓存可能不包含它们，需要强制重新扫描。
+# Streamlit Cloud 上中文字体在 packages.txt 阶段后安装，需强制重扫
 try:
     fm._load_fontmanager(try_read_cache=False)
 except Exception:
     pass
 
-# 中文字体设置（兼容 macOS 本地 + Linux 服务器）
 plt.rcParams["font.sans-serif"] = [
-    "Heiti TC",
-    "Arial Unicode MS",
-    "Noto Sans CJK SC",
-    "WenQuanYi Zen Hei",
-    "WenQuanYi Micro Hei",
-    "DejaVu Sans",
+    "Heiti TC", "Arial Unicode MS", "Noto Sans CJK SC",
+    "WenQuanYi Zen Hei", "WenQuanYi Micro Hei", "DejaVu Sans",
 ]
 plt.rcParams["axes.unicode_minus"] = False
 
 ROOT = Path(__file__).parent.parent.resolve()
 DB_PATH = ROOT / "data" / "wind_history.db"
 
-st.set_page_config(page_title="香港科技100 一致预期看板", layout="wide")
+st.set_page_config(
+    page_title="香港科技 100 · 盈利预期与股价联动看板",
+    layout="wide",
+)
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 
 # ============== 数据库查询 ==============
@@ -68,8 +72,7 @@ def get_codes_names(update_date):
     df = pd.read_sql_query(
         """SELECT DISTINCT wind_code, name FROM weekly_data
            WHERE update_date = ? ORDER BY wind_code""",
-        conn,
-        params=(update_date,),
+        conn, params=(update_date,),
     )
     conn.close()
     return df
@@ -81,8 +84,7 @@ def get_weekly_data(update_date):
     df = pd.read_sql_query(
         """SELECT trade_date, wind_code, name, netprofit_avg, close_hkd
            FROM weekly_data WHERE update_date = ? ORDER BY wind_code, trade_date""",
-        conn,
-        params=(update_date,),
+        conn, params=(update_date,),
     )
     conn.close()
     df["trade_date"] = pd.to_datetime(df["trade_date"])
@@ -93,7 +95,6 @@ def get_weekly_data(update_date):
 
 @st.cache_data(ttl=3600)
 def get_all_historical_weekly():
-    """读取全量历史 weekly 数据（用于时间差分析）。"""
     conn = get_conn()
     df = pd.read_sql_query(
         """SELECT trade_date, wind_code, name, netprofit_avg, close_hkd
@@ -112,14 +113,39 @@ def get_static_data(update_date):
     conn = get_conn()
     df = pd.read_sql_query(
         "SELECT * FROM static_indicators WHERE update_date = ? ORDER BY wind_code",
-        conn,
-        params=(update_date,),
+        conn, params=(update_date,),
     )
     conn.close()
     return df
 
 
-# ============== 侧边栏筛选 ==============
+# ============== 分析计算（一次跑全，三 Tab 共用） ==============
+@st.cache_data(ttl=3600, show_spinner=False)
+def run_full_analysis(hist_json: str, static_json: str | None):
+    hist_df = pd.read_json(StringIO(hist_json), orient="split")
+    hist_df["trade_date"] = pd.to_datetime(hist_df["trade_date"])
+
+    if static_json:
+        static_df = pd.read_json(StringIO(static_json), orient="split")
+    else:
+        static_df = None
+
+    agg, stock_best, _ = compute_all_cross_correlations(hist_df, max_lag=8)
+    df_a, df_b = bidirectional_prediction_regression(hist_df, forward_weeks=(1, 2, 4))
+    events_df, event_agg = build_event_study(hist_df, window=8)
+    state_results = state_dependent_cross_correlation(hist_df, static_df, max_lag=8)
+    _, gc, irf_data = var_granger_irf(hist_df, max_lag=8, irf_periods=12)
+
+    return {
+        "agg": agg, "stock_best": stock_best,
+        "df_a": df_a, "df_b": df_b,
+        "events_df": events_df, "event_agg": event_agg,
+        "state_results": state_results,
+        "gc": gc, "irf_data": irf_data,
+    }
+
+
+# ============== 侧边栏 ==============
 st.sidebar.header("筛选条件")
 
 available_dates = get_available_dates()
@@ -129,7 +155,6 @@ if not available_dates:
 
 selected_date = st.sidebar.selectbox("数据日期", available_dates, index=0)
 
-# 加载数据
 weekly_df = get_weekly_data(selected_date)
 static_df = get_static_data(selected_date)
 codes_names_df = get_codes_names(selected_date)
@@ -138,51 +163,46 @@ if weekly_df.empty:
     st.warning(f"{selected_date} 没有 weekly 数据。")
     st.stop()
 
-# 筛选方式
-filter_mode = st.sidebar.radio(
-    "筛选方式",
-    ["全部 100 只", "按股票代码", "按股票名称"],
-    index=0,
-)
-
-# 代码/名称下拉框（联动）
+# 统一选股控件：单一 selectbox，支持名称/代码模糊搜索
 all_codes = codes_names_df["wind_code"].tolist()
 all_names = codes_names_df["name"].tolist()
 code_to_name = dict(zip(codes_names_df["wind_code"], codes_names_df["name"]))
-name_to_code = dict(zip(codes_names_df["name"], codes_names_df["wind_code"]))
 
-selected_code = None
-selected_name = None
+ALL_TAG = "📊 全部 100 只"
+display_options = [ALL_TAG] + [
+    f"{name} ({code})" for code, name in zip(all_codes, all_names)
+]
 
-if filter_mode == "按股票代码":
-    selected_code = st.sidebar.selectbox("股票代码", all_codes, index=0)
-    selected_name = code_to_name.get(selected_code, "")
-    st.sidebar.markdown(f"**公司名称**：{selected_name}")
-elif filter_mode == "按股票名称":
-    selected_name = st.sidebar.selectbox("股票名称", all_names, index=0)
-    selected_code = name_to_code.get(selected_name, "")
-    st.sidebar.markdown(f"**股票代码**：{selected_code}")
+selected_display = st.sidebar.selectbox(
+    "选择股票",
+    display_options,
+    index=0,
+    help="可直接输入名称或代码进行模糊搜索（例：输入「腾讯」或「700」均可命中 0700.HK）",
+)
+
+if selected_display == ALL_TAG:
+    selected_code, selected_name = None, None
+else:
+    selected_name, _code_part = selected_display.rsplit(" (", 1)
+    selected_code = _code_part.rstrip(")")
 
 
 # ============== 页面标题 ==============
-st.title("香港科技100 一致预期看板")
+st.title("香港科技 100 · 盈利预期与股价联动看板")
 st.caption(f"数据日期：{selected_date}")
 
 
 # ============== Tab 路由 ==============
-if filter_mode == "全部 100 只":
-    tabs = st.tabs(["📈 100只概览", "⏱️ 时间差分析", "📋 静态指标"])
-    tab_overview, tab_leadlag, tab_static = tabs
-    tab_detail = None
-else:
-    tabs = st.tabs(["🔍 个股详情", "📈 100只概览", "⏱️ 时间差分析", "📋 静态指标"])
-    tab_detail, tab_overview, tab_leadlag, tab_static = tabs
+tab_market, tab_stock, tab_rank = st.tabs([
+    "📊 市场整体",
+    "🔍 个股深度",
+    "🏆 100 家排行榜",
+])
 
 
-# ============== 缓存渲染 100只概览 ==============
+# ============== 缓存渲染：100 只成分股全景 PNG ==============
 @st.cache_data(ttl=3600)
 def render_overview_png(weekly_json: str, date_str: str) -> bytes:
-    """把 100 只概览渲染为 PNG 字节并缓存，避免每次刷新都重绘。"""
     weekly_df = pd.read_json(StringIO(weekly_json), orient="split")
     weekly_df["trade_date"] = pd.to_datetime(weekly_df["trade_date"])
     grouped = weekly_df.groupby("wind_code")
@@ -191,7 +211,6 @@ def render_overview_png(weekly_json: str, date_str: str) -> bytes:
     n_cols = 4
     n_rows = (n_codes + n_cols - 1) // n_cols
 
-    # 高 dpi + 合理 figsize，保证清晰度同时控制内存
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(20, 3.5 * n_rows), dpi=200, squeeze=False)
     fig.patch.set_facecolor("white")
 
@@ -203,30 +222,29 @@ def render_overview_png(weekly_json: str, date_str: str) -> bytes:
         sub = grouped.get_group(code).sort_values("trade_date")
         name = sub["name"].iloc[0] if not sub["name"].isna().all() else code
 
-        color1 = "#1f77b4"
-        ax.plot(sub["trade_date"], sub["netprofit_avg"], color=color1, linewidth=1.2, label="预测净利润")
-        ax.set_ylabel("净利润(百万)", color=color1, fontsize=9)
-        ax.tick_params(axis="y", labelcolor=color1, labelsize=7)
+        ax.plot(sub["trade_date"], sub["netprofit_avg"], color=PALETTE["forecast"], linewidth=1.4, label="预测净利润")
+        ax.set_ylabel("净利润(百万)", color=PALETTE["forecast"], fontsize=9)
+        ax.tick_params(axis="y", labelcolor=PALETTE["forecast"], labelsize=7)
 
         ax2 = ax.twinx()
-        color2 = "#ff7f0e"
-        ax2.plot(sub["trade_date"], sub["close_hkd"], color=color2, linewidth=1.2, linestyle="--", label="股价")
-        ax2.set_ylabel("股价(HKD)", color=color2, fontsize=9)
-        ax2.tick_params(axis="y", labelcolor=color2, labelsize=7)
+        ax2.plot(sub["trade_date"], sub["close_hkd"], color=PALETTE["price"], linewidth=1.4, linestyle="--", label="股价")
+        ax2.set_ylabel("股价(HKD)", color=PALETTE["price"], fontsize=9)
+        ax2.tick_params(axis="y", labelcolor=PALETTE["price"], labelsize=7)
 
-        # 标题字体加大，提升可读性
-        ax.set_title(f"{name}\n{code}", fontsize=11, fontweight="bold")
+        ax.set_title(f"{name}\n{code}", fontsize=11, fontweight="bold", color=PALETTE["title"])
 
         n_ticks = min(3, len(sub))
         if n_ticks > 0:
             step = max(1, len(sub) // n_ticks)
             tick_positions = sub["trade_date"].iloc[::step]
             ax.set_xticks(tick_positions)
-            ax.set_xticklabels([d.strftime("%m-%d") for d in tick_positions], rotation=45, ha="right", fontsize=6)
+            ax.set_xticklabels(
+                [d.strftime("%m-%d") for d in tick_positions],
+                rotation=45, ha="right", fontsize=6,
+            )
 
         ax.grid(True, alpha=0.25, linestyle=":")
 
-    # 隐藏空白子图
     for idx in range(n_codes, n_rows * n_cols):
         row = idx // n_cols
         col = idx % n_cols
@@ -239,40 +257,55 @@ def render_overview_png(weekly_json: str, date_str: str) -> bytes:
     return buf.getvalue()
 
 
-# ============== Tab 1/2: 100只概览 (matplotlib) ==============
-with tab_overview:
-    st.subheader("预测净利润平均值 vs 股价")
+# ============== 预热：加载历史 + 跑完所有分析 ==============
+hist_df = get_all_historical_weekly()
+analysis = None
+if not hist_df.empty:
+    with st.spinner("首次加载需 15–30 秒（之后命中缓存）……"):
+        hist_json = hist_df.to_json(orient="split", date_format="iso")
+        static_json = static_df.to_json(orient="split") if not static_df.empty else None
+        analysis = run_full_analysis(hist_json, static_json)
+
+
+# ============================================================
+# Tab 1：市场整体
+# ============================================================
+with tab_market:
+    # ── 成分股全景 ──
+    st.subheader("成分股全景")
+    st.caption("100 只股票的预测净利润（橙）与股价（蓝）双 Y 轴")
 
     codes = sorted(weekly_df["wind_code"].unique())
-    n_codes = len(codes)
-    if n_codes == 0:
+    if not codes:
         st.warning("暂无数据。")
     else:
-        # 用 JSON 串作为缓存 key（比直接传 DataFrame 更稳定）
-        png_bytes = render_overview_png(weekly_df.to_json(orient="split", date_format="iso"), selected_date)
-        st.image(png_bytes, use_container_width=True)
+        png_bytes = render_overview_png(
+            weekly_df.to_json(orient="split", date_format="iso"), selected_date
+        )
+        st.image(png_bytes, width="stretch")
 
-
-# ============== Tab: 时间差分析 (Layer 1) ==============
-with tab_leadlag:
-    st.subheader("Layer 1：谁领先谁？领先多久？")
-    st.caption("k > 0：预期领先股价 | k < 0：股价领先预期 | k = 0：基本同步")
-
-    hist_df = get_all_historical_weekly()
-    if hist_df.empty:
-        st.warning("暂无历史数据。")
+    if analysis is None:
+        st.warning("暂无历史数据可供时序分析。")
     else:
-        with st.spinner("正在计算交叉相关（约需 10–20 秒）……"):
-            agg, stock_best, _ = compute_all_cross_correlations(hist_df, max_lag=8)
+        agg = analysis["agg"]
+        stock_best = analysis["stock_best"]
+        df_a, df_b = analysis["df_a"], analysis["df_b"]
+        events_df, event_agg = analysis["events_df"], analysis["event_agg"]
+        state_results = analysis["state_results"]
+        gc, irf_data = analysis["gc"], analysis["irf_data"]
+
+        # ── 交叉相关 ──
+        st.divider()
+        st.subheader("盈利预期与股价的交叉相关性")
+        st.caption("k > 0：预期领先股价 ｜ k < 0：股价领先预期 ｜ k = 0：基本同步")
 
         if agg.empty:
             st.warning("数据不足以计算交叉相关。")
         else:
-            # 结论卡片
             best_idx = agg["mean_pearson"].abs().idxmax()
             best_row = agg.loc[best_idx]
             best_lag = int(best_row["lag"])
-            best_corr = best_row["mean_pearson"]
+            best_corr = float(best_row["mean_pearson"])
 
             if best_lag > 0:
                 lead_text = f"预期平均领先股价 **{best_lag} 周**"
@@ -281,35 +314,33 @@ with tab_leadlag:
             else:
                 lead_text = "预期与股价基本同步"
 
-            st.info(f"📊 结论：{lead_text}（平均相关系数 = {best_corr:.3f}）")
+            st.info(f"结论：{lead_text}（平均相关系数 = {best_corr:.3f}）")
 
-            # 交叉相关图（截面平均）
             fig1, ax1 = plt.subplots(figsize=(10, 5), dpi=150)
-            colors = ["#2ecc71" if c > 0 else "#e74c3c" for c in agg["mean_pearson"]]
-            ax1.bar(agg["lag"], agg["mean_pearson"], color=colors, alpha=0.7)
+            ax1.bar(agg["lag"], agg["mean_pearson"], color=bar_color(agg["mean_pearson"]), alpha=0.85)
             ax1.axhline(y=0, color="black", linewidth=0.8)
             ax1.set_xlabel("Lag (周)", fontsize=11)
             ax1.set_ylabel("平均 Pearson 相关系数", fontsize=11)
-            ax1.set_title("交叉相关图（截面平均）：盈利预期变化 vs 股价收益率", fontsize=13, fontweight="bold")
+            ax1.set_title("交叉相关图（截面平均）", fontsize=13, fontweight="bold", color=PALETTE["title"])
             ax1.set_xticks(agg["lag"])
             ax1.grid(True, alpha=0.3)
             st.pyplot(fig1)
 
-            # 统计表格
             tbl = agg.copy()
             tbl.columns = ["Lag(周)", "Pearson均值", "Pearson标准差", "Spearman均值", "Spearman标准差", "股票数", "T统计量", "P值"]
-            st.dataframe(tbl.round(3), use_container_width=True, hide_index=True)
+            st.dataframe(tbl.round(3), width="stretch", hide_index=True)
 
-            # 个股最优 lag 分布
             if not stock_best.empty:
-                st.subheader("个股层面的领先-滞后分布")
+                st.markdown("**个股层面的领先-滞后分布**")
                 fig2, ax2 = plt.subplots(figsize=(10, 4), dpi=150)
                 lag_counts = stock_best["best_lag"].value_counts().sort_index()
-                bar_colors = ["#e74c3c" if l < 0 else "#3498db" if l > 0 else "#95a5a6" for l in lag_counts.index]
-                ax2.bar(lag_counts.index.astype(str), lag_counts.values, color=bar_colors, alpha=0.7)
+                ax2.bar(
+                    lag_counts.index.astype(str), lag_counts.values,
+                    color=lag_color(lag_counts.index.tolist()), alpha=0.85,
+                )
                 ax2.set_xlabel("最优 Lag (周)", fontsize=11)
                 ax2.set_ylabel("股票数量", fontsize=11)
-                ax2.set_title("每只股票的最优领先/滞后周数分布", fontsize=13, fontweight="bold")
+                ax2.set_title("每只股票的最优领先/滞后周数分布", fontsize=13, fontweight="bold", color=PALETTE["title"])
                 ax2.grid(True, alpha=0.3)
                 st.pyplot(fig2)
 
@@ -323,432 +354,500 @@ with tab_leadlag:
                 c2.metric("预期领先股价", f"{n_expect_lead} 只", f"{n_expect_lead / total * 100:.1f}%")
                 c3.metric("基本同步", f"{n_sync} 只", f"{n_sync / total * 100:.1f}%")
 
-            # ── 交互式：单只股票交叉相关 ──
-            st.divider()
-            st.subheader("🔍 单只股票交叉相关分析（交互式）")
+        # ── 预测力检验与事件影响 ──
+        st.divider()
+        st.subheader("预测力检验与事件影响")
 
-            # 取有结果的股票列表
-            available_codes = sorted(stock_best["wind_code"].unique()) if not stock_best.empty else []
-            if available_codes:
-                # 用 name + code 组合显示
-                name_map = dict(zip(codes_names_df["wind_code"], codes_names_df["name"]))
-                display_options = [f"{name_map.get(c, c)} ({c})" for c in available_codes]
-                selected_display = st.selectbox("选择股票", display_options, index=0)
-                selected_code_ll = selected_display.split("(")[-1].rstrip(")")
+        # 双向回归
+        st.markdown("##### 双向预测回归")
+        st.caption("方向 A：预期变化 → 未来股价收益 ｜ 方向 B：股价收益 → 未来预期变化")
 
-                # 从 stock_best 取该股票的最优 lag
-                sb = stock_best[stock_best["wind_code"] == selected_code_ll]
-                if not sb.empty:
-                    best_lag_stock = int(sb.iloc[0]["best_lag"])
-                    best_corr_stock = sb.iloc[0]["best_corr"]
-                    st.markdown(
-                        f"**{name_map.get(selected_code_ll, selected_code_ll)}**："
-                        f"最优 lag = **{best_lag_stock} 周**，"
-                        f"相关系数 = **{best_corr_stock:.3f}**"
-                    )
+        col_a, col_b = st.columns(2)
 
-                # 用 Plotly 画该股票的交叉相关柱状图
-                # 需要从 df_raw 中筛选（但之前用 _ 丢弃了），重新计算单只
-                from leadlag_analysis import prepare_stock_series, cross_correlation_series
+        def _agg_dir(df):
+            if df.empty:
+                return pd.DataFrame()
+            return (
+                df.groupby("lag").agg(
+                    mean_beta=("beta", "mean"),
+                    std_beta=("beta", "std"),
+                    mean_r2=("r_squared", "mean"),
+                    std_r2=("r_squared", "std"),
+                    sig_pct=("p_value", lambda x: (x < 0.05).mean() * 100),
+                    n=("wind_code", "nunique"),
+                ).reset_index()
+            )
 
-                sub_hist = prepare_stock_series(hist_df, selected_code_ll)
-                single_corr = cross_correlation_series(sub_hist["delta_f"], sub_hist["return_r"], max_lag=8)
-                if single_corr:
-                    lags_s = sorted(single_corr.keys())
-                    pearsons_s = [single_corr[l]["pearson_r"] for l in lags_s]
-                    spearmans_s = [single_corr[l]["spearman_r"] for l in lags_s]
+        agg_a = _agg_dir(df_a)
+        agg_b = _agg_dir(df_b)
 
-                    fig3 = go.Figure()
-                    fig3.add_trace(go.Bar(
-                        x=lags_s,
-                        y=pearsons_s,
-                        name="Pearson",
-                        marker_color=["#2ecc71" if v > 0 else "#e74c3c" for v in pearsons_s],
-                        opacity=0.8,
-                    ))
-                    fig3.add_trace(go.Scatter(
-                        x=lags_s,
-                        y=spearmans_s,
-                        name="Spearman",
-                        mode="lines+markers",
-                        line=dict(color="#3498db", width=2),
-                        marker=dict(size=8),
-                    ))
-                    fig3.add_hline(y=0, line_dash="dash", line_color="black")
-                    fig3.update_layout(
-                        title=f"{name_map.get(selected_code_ll, selected_code_ll)} 的交叉相关图",
-                        xaxis_title="Lag (周)",
-                        yaxis_title="相关系数",
-                        height=400,
-                        hovermode="x unified",
-                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
-                    )
-                    st.plotly_chart(fig3, use_container_width=True)
-
-            # ── Layer 2: 领先-滞后预测能力 + 事件研究 ──
-            st.divider()
-            st.subheader("Layer 2：领先-滞后有多强？能区分买卖时机吗？")
-
-            with st.spinner("正在计算双向回归与事件研究（约需 10–20 秒）……"):
-                df_a, df_b = bidirectional_prediction_regression(hist_df, forward_weeks=(1, 2, 4))
-                events_df, event_agg = build_event_study(hist_df, window=8)
-
-            # ── 2A: 双向预测回归 ──
-            st.markdown("#### 📈 双向预测回归")
-            st.caption("方向 A：预期变化 → 未来股价收益 | 方向 B：股价收益 → 未来预期变化")
-
-            col_a, col_b = st.columns(2)
-
-            with col_a:
-                st.markdown("**方向 A：预期 → 股价**")
-                if not df_a.empty:
-                    agg_a = (
-                        df_a.groupby("lag")
-                        .agg(
-                            mean_beta=("beta", "mean"),
-                            std_beta=("beta", "std"),
-                            mean_r2=("r_squared", "mean"),
-                            std_r2=("r_squared", "std"),
-                            sig_pct=("p_value", lambda x: (x < 0.05).mean() * 100),
-                            n=("wind_code", "nunique"),
-                        )
-                        .reset_index()
-                    )
-                    agg_a.columns = ["前瞻周数", "β均值", "β标准差", "R²均值", "R²标准差", "β显著占比(%)", "股票数"]
-                    st.dataframe(agg_a.round(4), use_container_width=True, hide_index=True)
-                else:
-                    st.warning("方向 A 数据不足。")
-
-            with col_b:
-                st.markdown("**方向 B：股价 → 预期**")
-                if not df_b.empty:
-                    agg_b = (
-                        df_b.groupby("lag")
-                        .agg(
-                            mean_beta=("beta", "mean"),
-                            std_beta=("beta", "std"),
-                            mean_r2=("r_squared", "mean"),
-                            std_r2=("r_squared", "std"),
-                            sig_pct=("p_value", lambda x: (x < 0.05).mean() * 100),
-                            n=("wind_code", "nunique"),
-                        )
-                        .reset_index()
-                    )
-                    agg_b.columns = ["前瞻周数", "β均值", "β标准差", "R²均值", "R²标准差", "β显著占比(%)", "股票数"]
-                    st.dataframe(agg_b.round(4), use_container_width=True, hide_index=True)
-                else:
-                    st.warning("方向 B 数据不足。")
-
-            # 结论卡片
-            if not df_a.empty and not df_b.empty:
-                best_a = agg_a.loc[agg_a["R²均值"].idxmax()]
-                best_b = agg_b.loc[agg_b["R²均值"].idxmax()]
-                if best_a["R²均值"] > best_b["R²均值"]:
-                    conclusion = (
-                        f"方向 A 更强：预期变化对未来 **{int(best_a['前瞻周数'])} 周** 股价的预测力更高"
-                        f"（平均 R² = {best_a['R²均值']:.4f}），"
-                        f"说明 **预期是领先指标**。"
-                    )
-                else:
-                    conclusion = (
-                        f"方向 B 更强：股价变化对未来 **{int(best_b['前瞻周数'])} 周** 预期变化的预测力更高"
-                        f"（平均 R² = {best_b['R²均值']:.4f}），"
-                        f"说明 **股价是领先指标**。"
-                    )
-                st.info(conclusion)
-
-            # ── 2B: 事件研究 ──
-            st.markdown("#### 📊 事件研究：预期大幅调整前后的股价反应")
-            st.caption("超额收益 = 个股收益 − 等权市场平均收益 | 事件定义：ΔF 处于历史 90%/10% 分位")
-
-            if event_agg.empty:
-                st.warning("事件研究数据不足。")
+        with col_a:
+            st.markdown("**方向 A：预期 → 股价**")
+            if not agg_a.empty:
+                disp = agg_a.copy()
+                disp.columns = ["前瞻周数", "β均值", "β标准差", "R²均值", "R²标准差", "β显著占比(%)", "股票数"]
+                st.dataframe(disp.round(4), width="stretch", hide_index=True)
             else:
-                # Plotly CAR 曲线
-                fig_car = go.Figure()
-                fig_car.add_trace(go.Scatter(
-                    x=event_agg["week"],
-                    y=event_agg["up_mean"],
-                    name="大幅上调",
-                    mode="lines+markers",
-                    line=dict(color="#2ecc71", width=2),
-                    marker=dict(size=8),
-                ))
-                fig_car.add_trace(go.Scatter(
-                    x=event_agg["week"],
-                    y=event_agg["down_mean"],
-                    name="大幅下调",
-                    mode="lines+markers",
-                    line=dict(color="#e74c3c", width=2),
-                    marker=dict(size=8),
-                ))
-                fig_car.add_hline(y=0, line_dash="dash", line_color="black")
-                fig_car.add_vline(x=0, line_dash="dot", line_color="gray", annotation_text="事件日")
-                fig_car.update_layout(
-                    title="累计超额收益（CAR）：预期大幅调整前后",
-                    xaxis_title="事件窗口（周）",
-                    yaxis_title="累计超额收益",
-                    height=450,
-                    hovermode="x unified",
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+                st.warning("方向 A 数据不足。")
+
+        with col_b:
+            st.markdown("**方向 B：股价 → 预期**")
+            if not agg_b.empty:
+                disp = agg_b.copy()
+                disp.columns = ["前瞻周数", "β均值", "β标准差", "R²均值", "R²标准差", "β显著占比(%)", "股票数"]
+                st.dataframe(disp.round(4), width="stretch", hide_index=True)
+            else:
+                st.warning("方向 B 数据不足。")
+
+        if not agg_a.empty and not agg_b.empty:
+            best_a = agg_a.loc[agg_a["mean_r2"].idxmax()]
+            best_b = agg_b.loc[agg_b["mean_r2"].idxmax()]
+            if best_a["mean_r2"] > best_b["mean_r2"]:
+                conclusion = (
+                    f"方向 A 更强：预期变化对未来 **{int(best_a['lag'])} 周** 股价的预测力更高"
+                    f"（平均 R² = {best_a['mean_r2']:.4f}），说明 **预期是领先指标**。"
                 )
-                st.plotly_chart(fig_car, use_container_width=True)
-
-                # 统计表格
-                tbl_ev = event_agg[["week", "up_mean", "up_t", "up_p", "up_n", "down_mean", "down_t", "down_p", "down_n"]].copy()
-                tbl_ev.columns = [
-                    "周", "上调CAR均值", "上调T", "上调P", "上调N",
-                    "下调CAR均值", "下调T", "下调P", "下调N",
-                ]
-                st.dataframe(tbl_ev.round(3), use_container_width=True, hide_index=True)
-
-                # 关键结论
-                up_event_week = event_agg[event_agg["week"] == 0]
-                if not up_event_week.empty:
-                    up_car = up_event_week.iloc[0]["up_mean"]
-                    up_p = up_event_week.iloc[0]["up_p"]
-                    down_car = up_event_week.iloc[0]["down_mean"]
-                    down_p = up_event_week.iloc[0]["down_p"]
-                    sig_up = "✅ 显著" if up_p < 0.05 else "❌ 不显著"
-                    sig_down = "✅ 显著" if down_p < 0.05 else "❌ 不显著"
-                    st.markdown(
-                        f"**事件当周**：上调事件 CAR = {up_car:.3f}（{sig_up}，p={up_p:.3f}）| "
-                        f"下调事件 CAR = {down_car:.3f}（{sig_down}，p={down_p:.3f}）"
-                    )
-
-            # ── Layer 3: 状态依赖 + VAR + IRF ──
-            st.divider()
-            st.subheader("Layer 3：在什么条件下成立？顶级量化框架")
-
-            with st.spinner("正在计算状态依赖分析与 VAR 模型（约需 15–30 秒）……"):
-                from leadlag_analysis import state_dependent_cross_correlation, var_granger_irf
-
-                state_results = state_dependent_cross_correlation(hist_df, static_df, max_lag=8)
-                var_results, gc, irf_data = var_granger_irf(hist_df, max_lag=8, irf_periods=12)
-
-            # ── 3A: 状态依赖分析 ──
-            st.markdown("#### 📊 状态依赖：不同市场状态下的领先-滞后关系")
-            st.caption("左列=市场状态（牛市/熊市） | 右列=覆盖度分组（高/低）")
-
-            if state_results:
-                c1, c2 = st.columns(2)
-                state_names = list(state_results.keys())
-                for i, name in enumerate(state_names):
-                    agg_state = state_results[name]
-                    if agg_state.empty:
-                        continue
-                    fig_s, ax_s = plt.subplots(figsize=(8, 4), dpi=150)
-                    colors = ["#2ecc71" if c > 0 else "#e74c3c" for c in agg_state["mean_pearson"]]
-                    ax_s.bar(agg_state["lag"], agg_state["mean_pearson"], color=colors, alpha=0.7)
-                    ax_s.axhline(y=0, color="black", linewidth=0.8)
-                    ax_s.set_xlabel("Lag (周)", fontsize=10)
-                    ax_s.set_ylabel("平均 Pearson r", fontsize=10)
-                    ax_s.set_title(f"{name}", fontsize=12, fontweight="bold")
-                    ax_s.set_xticks(agg_state["lag"])
-                    ax_s.grid(True, alpha=0.3)
-                    if i % 2 == 0:
-                        c1.pyplot(fig_s)
-                    else:
-                        c2.pyplot(fig_s)
-
-                # 状态对比结论
-                if "牛市" in state_results and "熊市" in state_results:
-                    bull_best = state_results["牛市"].loc[state_results["牛市"]["mean_pearson"].abs().idxmax()]
-                    bear_best = state_results["熊市"].loc[state_results["熊市"]["mean_pearson"].abs().idxmax()]
-                    st.info(
-                        f"牛市最优：lag={int(bull_best['lag'])}, r={bull_best['mean_pearson']:.3f} | "
-                        f"熊市最优：lag={int(bear_best['lag'])}, r={bear_best['mean_pearson']:.3f}"
-                    )
             else:
-                st.warning("状态依赖分析数据不足。")
+                conclusion = (
+                    f"方向 B 更强：股价变化对未来 **{int(best_b['lag'])} 周** 预期变化的预测力更高"
+                    f"（平均 R² = {best_b['mean_r2']:.4f}），说明 **股价是领先指标**。"
+                )
+            st.info(conclusion)
 
-            # ── 3B: VAR + 格兰杰因果 ──
-            st.markdown("#### 🔬 VAR 模型 + 格兰杰因果检验")
+        # 事件研究
+        st.markdown("##### 事件研究：预期大幅调整的市场反应")
+        st.caption("超额收益 = 个股收益 − 等权市场平均收益 ｜ 事件定义：ΔF 处于历史 90%/10% 分位")
 
-            if gc:
-                gc_cols = st.columns(2)
-                with gc_cols[0]:
-                    st.metric(
-                        "预期 → 股价",
-                        f"F = {gc['f_to_r']['stat']:.3f}",
-                        f"p = {gc['f_to_r']['pvalue']:.3f} {'✅ 显著' if gc['f_to_r']['sig'] else '❌ 不显著'}",
-                    )
-                with gc_cols[1]:
-                    st.metric(
-                        "股价 → 预期",
-                        f"F = {gc['r_to_f']['stat']:.3f}",
-                        f"p = {gc['r_to_f']['pvalue']:.3f} {'✅ 显著' if gc['r_to_f']['sig'] else '❌ 不显著'}",
-                    )
-
-                if gc["f_to_r"]["sig"] or gc["r_to_f"]["sig"]:
-                    direction = []
-                    if gc["f_to_r"]["sig"]:
-                        direction.append("预期变化**格兰杰引起**股价变化")
-                    if gc["r_to_f"]["sig"]:
-                        direction.append("股价变化**格兰杰引起**预期变化")
-                    st.success(" → ".join(direction))
-                else:
-                    st.warning("两个方向均未通过格兰杰因果检验：价格和预期之间不存在统计上可识别的领先-滞后因果关系。")
-            else:
-                st.warning("VAR 模型拟合失败（样本量不足）。")
-
-            # ── 3C: 脉冲响应函数（IRF）──
-            st.markdown("#### 🎯 脉冲响应函数（IRF）")
-            st.caption("一个标准差冲击后，另一变量的动态反应路径（95% 置信区间）")
-
-            if irf_data:
-                irf_c1, irf_c2 = st.columns(2)
-
-                with irf_c1:
-                    fig_irf1 = go.Figure()
-                    periods = irf_data["periods"]
-                    fig_irf1.add_trace(go.Scatter(
-                        x=periods, y=irf_data["df_to_r"],
-                        name="点估计", mode="lines+markers",
-                        line=dict(color="#1f77b4", width=2),
-                    ))
-                    fig_irf1.add_trace(go.Scatter(
-                        x=periods + periods[::-1],
-                        y=irf_data["df_to_r_upper"] + irf_data["df_to_r_lower"][::-1],
-                        fill="toself", fillcolor="rgba(31,119,180,0.2)",
-                        line=dict(color="rgba(255,255,255,0)"),
-                        name="95% CI", showlegend=True,
-                    ))
-                    fig_irf1.add_hline(y=0, line_dash="dash", line_color="black")
-                    fig_irf1.update_layout(
-                        title="预期冲击 → 股价响应",
-                        xaxis_title="期数（周）",
-                        yaxis_title="响应幅度",
-                        height=350,
-                        hovermode="x unified",
-                    )
-                    st.plotly_chart(fig_irf1, use_container_width=True)
-
-                with irf_c2:
-                    fig_irf2 = go.Figure()
-                    fig_irf2.add_trace(go.Scatter(
-                        x=periods, y=irf_data["r_to_df"],
-                        name="点估计", mode="lines+markers",
-                        line=dict(color="#ff7f0e", width=2),
-                    ))
-                    fig_irf2.add_trace(go.Scatter(
-                        x=periods + periods[::-1],
-                        y=irf_data["r_to_df_upper"] + irf_data["r_to_df_lower"][::-1],
-                        fill="toself", fillcolor="rgba(255,127,14,0.2)",
-                        line=dict(color="rgba(255,255,255,0)"),
-                        name="95% CI", showlegend=True,
-                    ))
-                    fig_irf2.add_hline(y=0, line_dash="dash", line_color="black")
-                    fig_irf2.update_layout(
-                        title="股价冲击 → 预期响应",
-                        xaxis_title="期数（周）",
-                        yaxis_title="响应幅度",
-                        height=350,
-                        hovermode="x unified",
-                    )
-                    st.plotly_chart(fig_irf2, use_container_width=True)
-            else:
-                st.warning("IRF 数据不可用。")
-
-
-# ============== Tab: 个股详情 (plotly 交互式) ==============
-if tab_detail is not None:
-    with tab_detail:
-        stock_df = weekly_df[weekly_df["wind_code"] == selected_code].sort_values("trade_date")
-
-        if stock_df.empty:
-            st.warning(f"{selected_code} 没有数据。")
+        if event_agg.empty:
+            st.warning("事件研究数据不足。")
         else:
-            st.subheader(f"{selected_name} ({selected_code})")
+            fig_car = go.Figure()
+            fig_car.add_trace(go.Scatter(
+                x=event_agg["week"], y=event_agg["up_mean"],
+                name="大幅上调", mode="lines+markers",
+                line=dict(color=PALETTE["up"], width=2.5),
+                marker=dict(size=8),
+            ))
+            fig_car.add_trace(go.Scatter(
+                x=event_agg["week"], y=event_agg["down_mean"],
+                name="大幅下调", mode="lines+markers",
+                line=dict(color=PALETTE["down"], width=2.5),
+                marker=dict(size=8),
+            ))
+            fig_car.add_hline(y=0, line_dash="dash", line_color="#888")
+            fig_car.add_vline(x=0, line_dash="dot", line_color="#AAA", annotation_text="事件日")
+            fig_car.update_layout(
+                title="累计超额收益（CAR）：预期大幅调整前后",
+                xaxis_title="事件窗口（周）", yaxis_title="累计超额收益",
+                height=450, hovermode="x unified",
+                **PLOTLY_LAYOUT,
+            )
+            st.plotly_chart(fig_car, width="stretch")
 
-            # Plotly 交互式双Y轴图
+            tbl_ev = event_agg[["week", "up_mean", "up_t", "up_p", "up_n", "down_mean", "down_t", "down_p", "down_n"]].copy()
+            tbl_ev.columns = ["周", "上调CAR均值", "上调T", "上调P", "上调N", "下调CAR均值", "下调T", "下调P", "下调N"]
+            st.dataframe(tbl_ev.round(3), width="stretch", hide_index=True)
+
+            ev0 = event_agg[event_agg["week"] == 0]
+            if not ev0.empty:
+                up_car = ev0.iloc[0]["up_mean"]; up_p = ev0.iloc[0]["up_p"]
+                down_car = ev0.iloc[0]["down_mean"]; down_p = ev0.iloc[0]["down_p"]
+                sig_up = "显著" if up_p < 0.05 else "不显著"
+                sig_down = "显著" if down_p < 0.05 else "不显著"
+                st.markdown(
+                    f"**事件当周**：上调事件 CAR = {up_car:.3f}（{sig_up}，p={up_p:.3f}）｜ "
+                    f"下调事件 CAR = {down_car:.3f}（{sig_down}，p={down_p:.3f}）"
+                )
+
+        # ── 条件分析与动态因果框架 ──
+        st.divider()
+        st.subheader("条件分析与动态因果框架")
+
+        # 状态依赖
+        st.markdown("##### 状态依赖：分市场状态的领先-滞后")
+        st.caption("左列＝市场状态（牛/熊）｜ 右列＝机构覆盖度（高/低）")
+
+        if state_results:
+            sc1, sc2 = st.columns(2)
+            state_names = list(state_results.keys())
+            for i, name in enumerate(state_names):
+                agg_state = state_results[name]
+                if agg_state.empty:
+                    continue
+                fig_s, ax_s = plt.subplots(figsize=(8, 4), dpi=150)
+                ax_s.bar(
+                    agg_state["lag"], agg_state["mean_pearson"],
+                    color=bar_color(agg_state["mean_pearson"]), alpha=0.85,
+                )
+                ax_s.axhline(y=0, color="black", linewidth=0.8)
+                ax_s.set_xlabel("Lag (周)", fontsize=10)
+                ax_s.set_ylabel("平均 Pearson r", fontsize=10)
+                ax_s.set_title(name, fontsize=12, fontweight="bold", color=PALETTE["title"])
+                ax_s.set_xticks(agg_state["lag"])
+                ax_s.grid(True, alpha=0.3)
+                (sc1 if i % 2 == 0 else sc2).pyplot(fig_s)
+
+            if "牛市" in state_results and "熊市" in state_results:
+                bull_best = state_results["牛市"].loc[state_results["牛市"]["mean_pearson"].abs().idxmax()]
+                bear_best = state_results["熊市"].loc[state_results["熊市"]["mean_pearson"].abs().idxmax()]
+                st.info(
+                    f"牛市最优：lag={int(bull_best['lag'])}, r={bull_best['mean_pearson']:.3f} ｜ "
+                    f"熊市最优：lag={int(bear_best['lag'])}, r={bear_best['mean_pearson']:.3f}"
+                )
+        else:
+            st.warning("状态依赖分析数据不足。")
+
+        # VAR + Granger
+        st.markdown("##### VAR 模型与格兰杰因果检验")
+        if gc:
+            gc1, gc2 = st.columns(2)
+            gc1.metric(
+                "预期 → 股价",
+                f"F = {gc['f_to_r']['stat']:.3f}",
+                f"p = {gc['f_to_r']['pvalue']:.3f}  {'显著' if gc['f_to_r']['sig'] else '不显著'}",
+            )
+            gc2.metric(
+                "股价 → 预期",
+                f"F = {gc['r_to_f']['stat']:.3f}",
+                f"p = {gc['r_to_f']['pvalue']:.3f}  {'显著' if gc['r_to_f']['sig'] else '不显著'}",
+            )
+
+            if gc["f_to_r"]["sig"] or gc["r_to_f"]["sig"]:
+                pieces = []
+                if gc["f_to_r"]["sig"]:
+                    pieces.append("预期变化**格兰杰引起**股价变化")
+                if gc["r_to_f"]["sig"]:
+                    pieces.append("股价变化**格兰杰引起**预期变化")
+                st.success(" ｜ ".join(pieces))
+            else:
+                st.warning("两个方向均未通过格兰杰因果检验：价格和预期之间不存在统计上可识别的领先-滞后因果关系。")
+        else:
+            st.warning("VAR 模型拟合失败（样本量不足）。")
+
+        # IRF
+        st.markdown("##### 脉冲响应函数")
+        st.caption("一个标准差冲击后另一变量的动态反应路径（带 95% 置信区间）")
+
+        if irf_data:
+            ic1, ic2 = st.columns(2)
+            periods = irf_data["periods"]
+
+            with ic1:
+                fig_irf1 = go.Figure()
+                fig_irf1.add_trace(go.Scatter(
+                    x=periods, y=irf_data["df_to_r"],
+                    name="点估计", mode="lines+markers",
+                    line=dict(color=PALETTE["price"], width=2.5),
+                ))
+                fig_irf1.add_trace(go.Scatter(
+                    x=periods + periods[::-1],
+                    y=irf_data["df_to_r_upper"] + irf_data["df_to_r_lower"][::-1],
+                    fill="toself", fillcolor="rgba(190,184,220,0.35)",
+                    line=dict(color="rgba(255,255,255,0)"),
+                    name="95% CI", showlegend=True,
+                ))
+                fig_irf1.add_hline(y=0, line_dash="dash", line_color="#888")
+                fig_irf1.update_layout(
+                    title="预期冲击 → 股价响应",
+                    xaxis_title="期数（周）", yaxis_title="响应幅度",
+                    height=350, hovermode="x unified",
+                    **PLOTLY_LAYOUT,
+                )
+                st.plotly_chart(fig_irf1, width="stretch")
+
+            with ic2:
+                fig_irf2 = go.Figure()
+                fig_irf2.add_trace(go.Scatter(
+                    x=periods, y=irf_data["r_to_df"],
+                    name="点估计", mode="lines+markers",
+                    line=dict(color=PALETTE["forecast"], width=2.5),
+                ))
+                fig_irf2.add_trace(go.Scatter(
+                    x=periods + periods[::-1],
+                    y=irf_data["r_to_df_upper"] + irf_data["r_to_df_lower"][::-1],
+                    fill="toself", fillcolor="rgba(190,184,220,0.35)",
+                    line=dict(color="rgba(255,255,255,0)"),
+                    name="95% CI", showlegend=True,
+                ))
+                fig_irf2.add_hline(y=0, line_dash="dash", line_color="#888")
+                fig_irf2.update_layout(
+                    title="股价冲击 → 预期响应",
+                    xaxis_title="期数（周）", yaxis_title="响应幅度",
+                    height=350, hovermode="x unified",
+                    **PLOTLY_LAYOUT,
+                )
+                st.plotly_chart(fig_irf2, width="stretch")
+        else:
+            st.warning("IRF 数据不可用。")
+
+
+# ============================================================
+# Tab 2：个股深度
+# ============================================================
+with tab_stock:
+    if selected_code is None:
+        st.info("请在左侧「选择股票」下拉框中选定一只股票（支持输入名称或代码模糊搜索）。")
+    else:
+        st.subheader(f"{selected_name}（{selected_code}）")
+
+        # --- 顶部指标卡 ---
+        stock_df = weekly_df[weekly_df["wind_code"] == selected_code].sort_values("trade_date")
+        if not stock_df.empty:
+            latest = stock_df.iloc[-1]
+            first = stock_df.iloc[0]
+            price_chg = (latest["close_hkd"] / first["close_hkd"] - 1) * 100 if first["close_hkd"] else 0
+            np_chg = (latest["netprofit_avg"] / first["netprofit_avg"] - 1) * 100 if first["netprofit_avg"] else 0
+
+            mc1, mc2, mc3 = st.columns(3)
+            mc1.metric("最新股价（HKD）", f"{latest['close_hkd']:.2f}", f"{price_chg:+.1f}% (期间)")
+            mc2.metric("最新预测净利润（百万）", f"{latest['netprofit_avg']:,.0f}", f"{np_chg:+.1f}% (期间)")
+            mc3.metric("样本数（周）", f"{len(stock_df)}")
+
+        # --- K 线 / 净利润双 Y 轴 ---
+        if stock_df.empty:
+            st.warning(f"{selected_code} 在 {selected_date} 没有数据。")
+        else:
             fig = make_subplots(specs=[[{"secondary_y": True}]])
-
             fig.add_trace(
                 go.Scatter(
-                    x=stock_df["trade_date"],
-                    y=stock_df["netprofit_avg"],
-                    name="预测净利润（百万）",
-                    mode="lines+markers",
-                    line=dict(color="#1f77b4", width=2),
-                    marker=dict(size=4),
-                    hovertemplate="日期: %{x}<br>预测净利润: %{y:,.0f} 百万<extra></extra>",
+                    x=stock_df["trade_date"], y=stock_df["netprofit_avg"],
+                    name="预测净利润（百万）", mode="lines+markers",
+                    line=dict(color=PALETTE["forecast"], width=2.5), marker=dict(size=4),
+                    hovertemplate="%{x}<br>预测净利润: %{y:,.0f} 百万<extra></extra>",
                 ),
                 secondary_y=False,
             )
-
             fig.add_trace(
                 go.Scatter(
-                    x=stock_df["trade_date"],
-                    y=stock_df["close_hkd"],
-                    name="股价（HKD）",
-                    mode="lines+markers",
-                    line=dict(color="#ff7f0e", width=2, dash="dash"),
-                    marker=dict(size=4),
-                    hovertemplate="日期: %{x}<br>股价: %{y:,.2f} HKD<extra></extra>",
+                    x=stock_df["trade_date"], y=stock_df["close_hkd"],
+                    name="股价（HKD）", mode="lines+markers",
+                    line=dict(color=PALETTE["price"], width=2.5, dash="dash"), marker=dict(size=4),
+                    hovertemplate="%{x}<br>股价: %{y:,.2f} HKD<extra></extra>",
                 ),
                 secondary_y=True,
             )
-
             fig.update_layout(
-                title=dict(text=f"{selected_name} ({selected_code})", x=0.5),
-                hovermode="x unified",
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
-                margin=dict(l=60, r=60, t=80, b=40),
-                height=500,
+                title=dict(text="预测净利润 vs 股价", x=0.5),
+                height=460, hovermode="x unified",
+                **PLOTLY_LAYOUT,
             )
-
             fig.update_yaxes(title_text="预测净利润（百万）", secondary_y=False)
             fig.update_yaxes(title_text="股价（HKD）", secondary_y=True)
             fig.update_xaxes(title_text="日期")
+            st.plotly_chart(fig, width="stretch")
 
-            st.plotly_chart(fig, use_container_width=True)
+        # --- 该股交叉相关 ---
+        if analysis is not None and not hist_df.empty:
+            st.divider()
+            st.subheader("该股票的交叉相关性")
 
-            # 下方数据表格
-            st.subheader("📋 完整数据")
-            display_df = stock_df[["trade_date", "netprofit_avg", "close_hkd"]].copy()
-            display_df.columns = ["日期", "预测净利润平均值（百万）", "股价（HKD）"]
-            display_df["日期"] = display_df["日期"].dt.strftime("%Y-%m-%d")
-            display_df["预测净利润平均值（百万）"] = display_df["预测净利润平均值（百万）"].round(2)
-            display_df["股价（HKD）"] = display_df["股价（HKD）"].round(2)
+            sub_hist = prepare_stock_series(hist_df, selected_code)
+            single_corr = cross_correlation_series(sub_hist["delta_f"], sub_hist["return_r"], max_lag=8)
+            if single_corr:
+                lags_s = sorted(single_corr.keys())
+                pearsons_s = [single_corr[k]["pearson_r"] for k in lags_s]
+                spearmans_s = [single_corr[k]["spearman_r"] for k in lags_s]
+
+                fig_c = go.Figure()
+                fig_c.add_trace(go.Bar(
+                    x=lags_s, y=pearsons_s, name="Pearson",
+                    marker_color=bar_color(pearsons_s), opacity=0.85,
+                ))
+                fig_c.add_trace(go.Scatter(
+                    x=lags_s, y=spearmans_s, name="Spearman",
+                    mode="lines+markers",
+                    line=dict(color=PALETTE["band"], width=2.5),
+                    marker=dict(size=8),
+                ))
+                fig_c.add_hline(y=0, line_dash="dash", line_color="#888")
+                fig_c.update_layout(
+                    title=f"{selected_name} 的交叉相关图",
+                    xaxis_title="Lag (周)", yaxis_title="相关系数",
+                    height=380, hovermode="x unified",
+                    **PLOTLY_LAYOUT,
+                )
+                st.plotly_chart(fig_c, width="stretch")
+
+                stock_best = analysis["stock_best"]
+                sb = stock_best[stock_best["wind_code"] == selected_code]
+                if not sb.empty:
+                    best_lag_s = int(sb.iloc[0]["best_lag"])
+                    best_corr_s = float(sb.iloc[0]["best_corr"])
+                    st.info(
+                        f"最优 lag = **{best_lag_s} 周**，对应相关系数 = **{best_corr_s:.3f}**"
+                    )
+            else:
+                st.warning("该股票样本数不足以计算交叉相关。")
+
+            # --- 该股双向回归 ---
+            st.subheader("该股票的双向预测回归")
+            df_a = analysis["df_a"]; df_b = analysis["df_b"]
+            sub_a = df_a[df_a["wind_code"] == selected_code] if not df_a.empty else pd.DataFrame()
+            sub_b = df_b[df_b["wind_code"] == selected_code] if not df_b.empty else pd.DataFrame()
+
+            rc1, rc2 = st.columns(2)
+            with rc1:
+                st.markdown("**方向 A：预期 → 股价**")
+                if not sub_a.empty:
+                    d = sub_a[["lag", "beta", "r_squared", "p_value", "n_obs"]].copy()
+                    d.columns = ["前瞻周数", "β", "R²", "p 值", "样本数"]
+                    st.dataframe(d.round(4), width="stretch", hide_index=True)
+                else:
+                    st.caption("数据不足。")
+            with rc2:
+                st.markdown("**方向 B：股价 → 预期**")
+                if not sub_b.empty:
+                    d = sub_b[["lag", "beta", "r_squared", "p_value", "n_obs"]].copy()
+                    d.columns = ["前瞻周数", "β", "R²", "p 值", "样本数"]
+                    st.dataframe(d.round(4), width="stretch", hide_index=True)
+                else:
+                    st.caption("数据不足。")
+
+            # --- 该股事件 CAR ---
+            st.subheader("该股票的事件研究 CAR")
+            events_df = analysis["events_df"]
+            sub_ev = events_df[events_df["wind_code"] == selected_code] if not events_df.empty else pd.DataFrame()
+            if sub_ev.empty:
+                st.caption("该股票没有触发显著事件（90% / 10% 分位以外的 ΔF）。")
+            else:
+                weeks = list(range(-8, 9))
+                up_arr = [c for c in sub_ev[sub_ev["event_type"] == "大幅上调"]["car_cumsum"].tolist() if len(c) == 17]
+                down_arr = [c for c in sub_ev[sub_ev["event_type"] == "大幅下调"]["car_cumsum"].tolist() if len(c) == 17]
+
+                fig_e = go.Figure()
+                if up_arr:
+                    up_mean = np.nanmean(np.array(up_arr), axis=0)
+                    fig_e.add_trace(go.Scatter(
+                        x=weeks, y=up_mean, name=f"大幅上调 (n={len(up_arr)})",
+                        mode="lines+markers",
+                        line=dict(color=PALETTE["up"], width=2.5),
+                        marker=dict(size=7),
+                    ))
+                if down_arr:
+                    down_mean = np.nanmean(np.array(down_arr), axis=0)
+                    fig_e.add_trace(go.Scatter(
+                        x=weeks, y=down_mean, name=f"大幅下调 (n={len(down_arr)})",
+                        mode="lines+markers",
+                        line=dict(color=PALETTE["down"], width=2.5),
+                        marker=dict(size=7),
+                    ))
+                fig_e.add_hline(y=0, line_dash="dash", line_color="#888")
+                fig_e.add_vline(x=0, line_dash="dot", line_color="#AAA", annotation_text="事件日")
+                fig_e.update_layout(
+                    title=f"{selected_name} 的事件窗口累计超额收益",
+                    xaxis_title="事件窗口（周）", yaxis_title="累计超额收益",
+                    height=400, hovermode="x unified",
+                    **PLOTLY_LAYOUT,
+                )
+                st.plotly_chart(fig_e, width="stretch")
+
+
+# ============================================================
+# Tab 3：100 家排行榜
+# ============================================================
+with tab_rank:
+    st.subheader("100 家公司多维度排行榜")
+    st.caption("默认按 |相关系数| 降序。点击任意列头可切换排序。")
+
+    if analysis is None:
+        st.warning("尚无分析结果可用。")
+    else:
+        rank_df = build_ranking_df(
+            analysis["stock_best"],
+            analysis["df_a"],
+            analysis["df_b"],
+            analysis["events_df"],
+            codes_names_df,
+        )
+
+        if rank_df.empty:
+            st.warning("排行榜数据不足。")
+        else:
+            # ─ 头部 Top4 极值卡 ─
+            c1, c2, c3, c4 = st.columns(4)
+
+            valid_r = rank_df.dropna(subset=["相关r"])
+            if not valid_r.empty:
+                top_corr = valid_r.loc[valid_r["相关r"].abs().idxmax()]
+                c1.metric("最强相关性", f"{top_corr['名称']}", f"r = {top_corr['相关r']:.3f}（lag={int(top_corr['最优lag'])}）")
+            else:
+                c1.metric("最强相关性", "—", "—")
+
+            valid_a = rank_df.dropna(subset=["方向A R²"])
+            if not valid_a.empty:
+                top_predA = valid_a.loc[valid_a["方向A R²"].idxmax()]
+                c2.metric(
+                    "最强预测力（预期 → 股价）",
+                    f"{top_predA['名称']}",
+                    f"R² = {top_predA['方向A R²']:.3f}（前瞻 {int(top_predA['方向A 前瞻'])} 周）",
+                )
+            else:
+                c2.metric("最强预测力（预期 → 股价）", "—", "—")
+
+            valid_up = rank_df.dropna(subset=["上调CAR"])
+            if not valid_up.empty:
+                top_carUp = valid_up.loc[valid_up["上调CAR"].idxmax()]
+                c3.metric("最大上调 CAR", f"{top_carUp['名称']}", f"+{top_carUp['上调CAR']:.3f}")
+            else:
+                c3.metric("最大上调 CAR", "—", "—")
+
+            gc = analysis["gc"]
+            if gc:
+                g_dir = "预期 → 股价" if gc["f_to_r"]["sig"] else (
+                    "股价 → 预期" if gc["r_to_f"]["sig"] else "未通过"
+                )
+                g_p = min(gc["f_to_r"]["pvalue"], gc["r_to_f"]["pvalue"])
+                c4.metric("全市场 Granger 因果", g_dir, f"p = {g_p:.3f}")
+            else:
+                c4.metric("全市场 Granger 因果", "—", "—")
+
+            # ─ 主表 ─
+            st.markdown("##### 全量排行")
+            sorted_df = rank_df.assign(_abs=rank_df["相关r"].abs()).sort_values(
+                "_abs", ascending=False, na_position="last"
+            ).drop(columns=["_abs"])
 
             st.dataframe(
-                display_df,
-                use_container_width=True,
-                hide_index=True,
+                sorted_df,
+                width="stretch", hide_index=True,
                 column_config={
-                    "日期": st.column_config.TextColumn("日期", width="small"),
-                    "预测净利润平均值（百万）": st.column_config.NumberColumn("预测净利润平均值（百万）", format="%.2f"),
-                    "股价（HKD）": st.column_config.NumberColumn("股价（HKD）", format="%.2f"),
+                    "相关r":     st.column_config.NumberColumn("相关 r", format="%.3f"),
+                    "最优lag":   st.column_config.NumberColumn("最优 lag (周)", format="%d"),
+                    "方向A R²":  st.column_config.NumberColumn("方向A R²", format="%.3f"),
+                    "方向A 前瞻": st.column_config.NumberColumn("方向A 前瞻 (周)", format="%d"),
+                    "方向B R²":  st.column_config.NumberColumn("方向B R²", format="%.3f"),
+                    "方向B 前瞻": st.column_config.NumberColumn("方向B 前瞻 (周)", format="%d"),
+                    "上调CAR":   st.column_config.NumberColumn("上调 CAR", format="%+.3f"),
+                    "下调CAR":   st.column_config.NumberColumn("下调 CAR", format="%+.3f"),
                 },
             )
 
+            st.caption(
+                "说明：相关 r 来自 Layer 1 个股最优 lag；方向 A/B R² 取该股各前瞻期回归 R² 的最大值；"
+                "CAR 为事件窗口末端（事件后 8 周）累计超额收益的平均值。"
+            )
 
-# ============== Tab 3: 静态指标 ==============
-with tab_static:
-    st.subheader(f"一致预期静态指标 — {selected_date}")
-    if static_df.empty:
-        st.warning("暂无静态指标数据。")
-    else:
-        rename_map = {
-            "wind_code": "股票代码",
-            "name": "公司名称",
-            "inst_num_2025": "2025预测机构家数",
-            "netprofit_avg_2025": "2025预测净利润平均(百万)",
-            "netprofit_median_2025": "2025预测净利润中值(百万)",
-            "inst_num_2026": "2026预测机构家数",
-            "netprofit_avg_2026": "2026预测净利润平均(百万)",
-            "netprofit_median_2026": "2026预测净利润中值(百万)",
-        }
-        display_cols = [c for c in rename_map.keys() if c in static_df.columns]
-        display_df = static_df[display_cols].rename(columns=rename_map)
-
-        # 数值格式化
-        for col in display_df.columns:
-            if "百万" in col:
-                display_df[col] = display_df[col].round(2)
-            elif "家数" in col:
-                display_df[col] = display_df[col].fillna(0).astype(int)
-
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
-        st.caption("数据单位：百万元人民币 | 来源：Wind 一致预期")
+    # ─ 一致预期静态指标（折叠） ─
+    with st.expander("一致预期静态指标（机构数 / 预测净利润 / 标准差）", expanded=False):
+        if static_df.empty:
+            st.warning("暂无静态指标数据。")
+        else:
+            rename_map = {
+                "wind_code": "股票代码",
+                "name": "公司名称",
+                "inst_num_2025": "2025 预测机构家数",
+                "netprofit_avg_2025": "2025 预测净利润均值(百万)",
+                "netprofit_median_2025": "2025 预测净利润中值(百万)",
+                "inst_num_2026": "2026 预测机构家数",
+                "netprofit_avg_2026": "2026 预测净利润均值(百万)",
+                "netprofit_median_2026": "2026 预测净利润中值(百万)",
+            }
+            display_cols = [c for c in rename_map.keys() if c in static_df.columns]
+            disp = static_df[display_cols].rename(columns=rename_map)
+            for col in disp.columns:
+                if "百万" in col:
+                    disp[col] = disp[col].round(2)
+                elif "家数" in col:
+                    disp[col] = disp[col].fillna(0).astype(int)
+            st.dataframe(disp, width="stretch", hide_index=True)
+            st.caption("数据单位：百万元人民币 ｜ 来源：Wind 一致预期")
