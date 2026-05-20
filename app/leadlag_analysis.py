@@ -441,12 +441,18 @@ def var_granger_irf(weekly_df: pd.DataFrame, max_lag: int = 8, irf_periods: int 
         if actual_max_lag < 1:
             return None, None, None
         results = model.fit(maxlags=actual_max_lag, ic="aic")
+        # AIC 可能选出 0 阶，导致格兰杰因果检验失败；此时回退到 1 阶
+        if getattr(results, "k_ar", 0) < 1:
+            results = model.fit(1)
     except Exception:
         return None, None, None
 
     # 格兰杰因果检验
-    gc_f_to_r = results.test_causality("return_r", "delta_f", kind="f")
-    gc_r_to_f = results.test_causality("delta_f", "return_r", kind="f")
+    try:
+        gc_f_to_r = results.test_causality("return_r", "delta_f", kind="f")
+        gc_r_to_f = results.test_causality("delta_f", "return_r", kind="f")
+    except Exception:
+        return None, None, None
 
     gc = {
         "f_to_r": {
