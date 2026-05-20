@@ -401,9 +401,9 @@ with tab_market:
 
             def _color_event(val):
                 if val == "大幅上调":
-                    return f"background-color: {PALETTE['up']}; color: #2C3E50;"
+                    return f"background-color: {PALETTE['up']}; color: #1F1F1F;"
                 if val == "大幅下调":
-                    return f"background-color: {PALETTE['down']}; color: white;"
+                    return f"background-color: {PALETTE['down']}; color: #1F1F1F;"
                 return ""
 
             styled = ev.style.map(_color_event, subset=["事件"]) \
@@ -466,16 +466,23 @@ with tab_market:
 
             st.info(f"结论：{lead_text}（平均相关系数 = {best_corr:.3f}）")
 
-            fig1, ax1 = plt.subplots(figsize=(10, 5), dpi=150)
-            ax1.bar(agg["lag"], agg["mean_pearson"], color=bar_color(agg["mean_pearson"]), alpha=0.85)
-            ax1.axhline(y=0, color=PALETTE["axis"], linewidth=0.8)
-            ax1.set_xlabel("Lag (周)", fontsize=12, color=PALETTE["axis"])
-            ax1.set_ylabel("平均 Pearson 相关系数", fontsize=12, color=PALETTE["axis"])
-            ax1.set_title("交叉相关图（截面平均）", fontsize=14, fontweight="bold", color=PALETTE["title"])
-            ax1.tick_params(axis="both", labelcolor=PALETTE["axis"], labelsize=11)
-            ax1.set_xticks(agg["lag"])
-            ax1.grid(True, alpha=0.3)
-            st.pyplot(fig1)
+            fig1 = go.Figure()
+            fig1.add_trace(go.Bar(
+                x=agg["lag"], y=agg["mean_pearson"],
+                marker_color=bar_color(agg["mean_pearson"]),
+                marker_line_width=0,
+                hovertemplate="lag = %{x} 周<br>r = %{y:.3f}<extra></extra>",
+            ))
+            fig1.add_hline(y=0, line_color="#BBBBBB", line_width=1)
+            fig1.update_layout(
+                title=dict(text="交叉相关图（截面平均）", x=0.5, font=dict(color=PALETTE["title"], size=15)),
+                xaxis_title="Lag (周)", yaxis_title="平均 Pearson 相关系数",
+                height=420, bargap=0.25,
+                **PLOTLY_LAYOUT,
+            )
+            fig1.update_xaxes(showgrid=False, tickmode="linear", dtick=1, zeroline=False)
+            fig1.update_yaxes(showgrid=False, zeroline=True, zerolinecolor="#CCC")
+            st.plotly_chart(fig1, width="stretch")
 
             tbl = agg.copy()
             tbl.columns = ["Lag(周)", "Pearson均值", "Pearson标准差", "Spearman均值", "Spearman标准差", "股票数", "T统计量", "P值"]
@@ -483,18 +490,23 @@ with tab_market:
 
             if not stock_best.empty:
                 st.markdown("**个股层面的领先-滞后分布**")
-                fig2, ax2 = plt.subplots(figsize=(10, 4), dpi=150)
                 lag_counts = stock_best["best_lag"].value_counts().sort_index()
-                ax2.bar(
-                    lag_counts.index.astype(str), lag_counts.values,
-                    color=lag_color(lag_counts.index.tolist()), alpha=0.85,
+                fig2 = go.Figure()
+                fig2.add_trace(go.Bar(
+                    x=lag_counts.index.astype(int), y=lag_counts.values,
+                    marker_color=lag_color(lag_counts.index.tolist()),
+                    marker_line_width=0,
+                    hovertemplate="lag = %{x} 周<br>%{y} 只股票<extra></extra>",
+                ))
+                fig2.update_layout(
+                    title=dict(text="每只股票的最优领先/滞后周数分布", x=0.5, font=dict(color=PALETTE["title"], size=15)),
+                    xaxis_title="最优 Lag (周)", yaxis_title="股票数量",
+                    height=380, bargap=0.25,
+                    **PLOTLY_LAYOUT,
                 )
-                ax2.set_xlabel("最优 Lag (周)", fontsize=12, color=PALETTE["axis"])
-                ax2.set_ylabel("股票数量", fontsize=12, color=PALETTE["axis"])
-                ax2.set_title("每只股票的最优领先/滞后周数分布", fontsize=14, fontweight="bold", color=PALETTE["title"])
-                ax2.tick_params(axis="both", labelcolor=PALETTE["axis"], labelsize=11)
-                ax2.grid(True, alpha=0.3)
-                st.pyplot(fig2)
+                fig2.update_xaxes(showgrid=False, tickmode="linear", dtick=1, zeroline=False)
+                fig2.update_yaxes(showgrid=False)
+                st.plotly_chart(fig2, width="stretch")
 
                 n_price_lead = int((stock_best["best_lag"] < 0).sum())
                 n_expect_lead = int((stock_best["best_lag"] > 0).sum())
@@ -626,19 +638,23 @@ with tab_market:
                 agg_state = state_results[name]
                 if agg_state.empty:
                     continue
-                fig_s, ax_s = plt.subplots(figsize=(8, 4), dpi=150)
-                ax_s.bar(
-                    agg_state["lag"], agg_state["mean_pearson"],
-                    color=bar_color(agg_state["mean_pearson"]), alpha=0.85,
+                fig_s = go.Figure()
+                fig_s.add_trace(go.Bar(
+                    x=agg_state["lag"], y=agg_state["mean_pearson"],
+                    marker_color=bar_color(agg_state["mean_pearson"]),
+                    marker_line_width=0,
+                    hovertemplate="lag = %{x} 周<br>r = %{y:.3f}<extra></extra>",
+                ))
+                fig_s.add_hline(y=0, line_color="#BBBBBB", line_width=1)
+                fig_s.update_layout(
+                    title=dict(text=name, x=0.5, font=dict(color=PALETTE["title"], size=14)),
+                    xaxis_title="Lag (周)", yaxis_title="平均 Pearson r",
+                    height=340, bargap=0.25,
+                    **PLOTLY_LAYOUT,
                 )
-                ax_s.axhline(y=0, color=PALETTE["axis"], linewidth=0.8)
-                ax_s.set_xlabel("Lag (周)", fontsize=11, color=PALETTE["axis"])
-                ax_s.set_ylabel("平均 Pearson r", fontsize=11, color=PALETTE["axis"])
-                ax_s.set_title(name, fontsize=13, fontweight="bold", color=PALETTE["title"])
-                ax_s.tick_params(axis="both", labelcolor=PALETTE["axis"], labelsize=10)
-                ax_s.set_xticks(agg_state["lag"])
-                ax_s.grid(True, alpha=0.3)
-                (sc1 if i % 2 == 0 else sc2).pyplot(fig_s)
+                fig_s.update_xaxes(showgrid=False, tickmode="linear", dtick=1, zeroline=False)
+                fig_s.update_yaxes(showgrid=False)
+                (sc1 if i % 2 == 0 else sc2).plotly_chart(fig_s, width="stretch")
 
             if "牛市" in state_results and "熊市" in state_results:
                 bull_best = state_results["牛市"].loc[state_results["牛市"]["mean_pearson"].abs().idxmax()]
@@ -804,21 +820,26 @@ with tab_stock:
                 fig_c = go.Figure()
                 fig_c.add_trace(go.Bar(
                     x=lags_s, y=pearsons_s, name="Pearson",
-                    marker_color=bar_color(pearsons_s), opacity=0.85,
+                    marker_color=bar_color(pearsons_s),
+                    marker_line_width=0,
+                    hovertemplate="lag = %{x} 周<br>r = %{y:.3f}<extra>Pearson</extra>",
                 ))
                 fig_c.add_trace(go.Scatter(
                     x=lags_s, y=spearmans_s, name="Spearman",
                     mode="lines+markers",
-                    line=dict(color=PALETTE["band"], width=2.5),
+                    line=dict(color=PALETTE["price"], width=2.5),
                     marker=dict(size=8),
+                    hovertemplate="lag = %{x} 周<br>r = %{y:.3f}<extra>Spearman</extra>",
                 ))
-                fig_c.add_hline(y=0, line_dash="dash", line_color="#888")
+                fig_c.add_hline(y=0, line_color="#BBBBBB", line_width=1)
                 fig_c.update_layout(
-                    title=f"{selected_name} 的交叉相关图",
+                    title=dict(text=f"{selected_name} 的交叉相关图", x=0.5, font=dict(color=PALETTE["title"], size=15)),
                     xaxis_title="Lag (周)", yaxis_title="相关系数",
-                    height=380, hovermode="x unified",
+                    height=400, bargap=0.25, hovermode="x unified",
                     **PLOTLY_LAYOUT,
                 )
+                fig_c.update_xaxes(showgrid=False, tickmode="linear", dtick=1, zeroline=False)
+                fig_c.update_yaxes(showgrid=False)
                 st.plotly_chart(fig_c, width="stretch")
 
                 stock_best = analysis["stock_best"]

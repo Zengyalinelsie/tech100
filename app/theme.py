@@ -4,14 +4,14 @@
 """
 
 PALETTE = {
-    "up":        "#C82423",  # 深红 — 涨/正/上调事件
-    "up_soft":   "#FF8884",  # 粉红 — 弱涨/辅助
-    "down":      "#2878B5",  # 深蓝 — 跌/负/下调事件
-    "down_soft": "#9AC9DB",  # 浅蓝 — 辅助/CI 带
-    "price":     "#2878B5",  # 股价线（= down 同色）
-    "forecast":  "#F8AC8C",  # 浅橙 — 预期/净利润线
-    "neutral":   "#666666",  # 中深灰 — 同步/不显著
-    "band":      "rgba(154,201,219,0.40)",
+    "up":        "#E9B5C1",  # 柔和粉 — 涨/正/上调事件
+    "up_soft":   "#F4D8DF",  # 极浅粉 — 辅助
+    "down":      "#B4C5D9",  # 柔和浅蓝 — 跌/负/下调事件
+    "down_soft": "#D6E0EC",  # 极浅蓝 — 辅助/CI 带
+    "price":     "#5A88B0",  # 中度蓝 — 股价线（保留可读性）
+    "forecast":  "#F2A07B",  # 中橙 — 预期/净利润线
+    "neutral":   "#9A9A9A",  # 中灰 — 同步/不显著
+    "band":      "rgba(180,197,217,0.35)",
     "axis":      "#333333",  # 坐标轴文字
     "title":     "#1F1F1F",  # 标题
 }
@@ -71,8 +71,9 @@ section[data-testid="stSidebar"] { background-color: #FAFAFA; }
     color: #333;
 }
 .stTabs [aria-selected="true"] {
-    background: #2878B5 !important;
-    color: white !important;
+    background: #B4C5D9 !important;
+    color: #1F1F1F !important;
+    font-weight: 600;
 }
 </style>
 """
