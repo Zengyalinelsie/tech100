@@ -6,6 +6,7 @@
 """
 import io
 import sqlite3
+from datetime import datetime
 from io import StringIO
 from pathlib import Path
 
@@ -24,6 +25,7 @@ from leadlag_analysis import (
     state_dependent_cross_correlation,
     var_granger_irf,
     build_ranking_df,
+    detect_recent_events,
     prepare_stock_series,
     cross_correlation_series,
 )
@@ -153,7 +155,24 @@ if not available_dates:
     st.error("数据库为空，请先运行采集脚本。")
     st.stop()
 
-selected_date = st.sidebar.selectbox("数据日期", available_dates, index=0)
+available_dates_dt = [datetime.strptime(d, "%Y-%m-%d").date() for d in available_dates]
+max_d, min_d = max(available_dates_dt), min(available_dates_dt)
+
+picked = st.sidebar.date_input(
+    "数据日期",
+    value=max_d,
+    min_value=min_d,
+    max_value=max_d,
+    format="YYYY-MM-DD",
+)
+
+# 最近邻：取 ≤ 用户所选日期的最近一个有效数据日
+candidates = [d for d in available_dates_dt if d <= picked]
+actual_d = max(candidates) if candidates else max_d
+selected_date = actual_d.strftime("%Y-%m-%d")
+
+if actual_d != picked:
+    st.sidebar.caption(f"📅 最近有效数据日期：{selected_date}")
 
 weekly_df = get_weekly_data(selected_date)
 static_df = get_static_data(selected_date)
@@ -163,22 +182,41 @@ if weekly_df.empty:
     st.warning(f"{selected_date} 没有 weekly 数据。")
     st.stop()
 
-# 统一选股控件：单一 selectbox，支持名称/代码模糊搜索
+# 统一选股控件：text_input + 自实现 substring 过滤 + 候选清单
 all_codes = codes_names_df["wind_code"].tolist()
 all_names = codes_names_df["name"].tolist()
 code_to_name = dict(zip(codes_names_df["wind_code"], codes_names_df["name"]))
 
 ALL_TAG = "📊 全部 100 只"
-display_options = [ALL_TAG] + [
-    f"{name} ({code})" for code, name in zip(all_codes, all_names)
-]
+display_options = [f"{name} ({code})" for code, name in zip(all_codes, all_names)]
 
-selected_display = st.sidebar.selectbox(
+st.sidebar.markdown("**选择股票**")
+search = st.sidebar.text_input(
     "选择股票",
-    display_options,
-    index=0,
-    help="可直接输入名称或代码进行模糊搜索（例：输入「腾讯」或「700」均可命中 0700.HK）",
+    placeholder="输入名称或代码，例如：腾讯、700",
+    label_visibility="collapsed",
+    key="stock_search",
 )
+
+if not search.strip():
+    selected_display = ALL_TAG
+    st.sidebar.caption(f"当前：{ALL_TAG}（共 {len(display_options)} 只）")
+else:
+    s = search.strip().lower()
+    matches = [o for o in display_options if s in o.lower()]
+    if len(matches) == 0:
+        st.sidebar.warning(f"未找到匹配「{search}」的股票")
+        selected_display = ALL_TAG
+    elif len(matches) == 1:
+        selected_display = matches[0]
+        st.sidebar.caption(f"✓ {matches[0]}")
+    else:
+        selected_display = st.sidebar.selectbox(
+            f"匹配 {len(matches)} 项",
+            matches, index=0,
+            label_visibility="collapsed",
+            key="stock_pick",
+        )
 
 if selected_display == ALL_TAG:
     selected_code, selected_name = None, None
@@ -192,6 +230,63 @@ st.title("香港科技 100 · 盈利预期与股价联动看板")
 st.caption(f"数据日期：{selected_date}")
 
 
+# ============== 预热：加载历史 + 跑完所有分析 ==============
+hist_df = get_all_historical_weekly()
+analysis = None
+if not hist_df.empty:
+    with st.spinner("首次加载需 15–30 秒（之后命中缓存）……"):
+        hist_json = hist_df.to_json(orient="split", date_format="iso")
+        static_json = static_df.to_json(orient="split") if not static_df.empty else None
+        analysis = run_full_analysis(hist_json, static_json)
+
+# 最近 1 周 / 4 周事件（用于 KPI 状态栏 + 本周事件被动表）
+recent_events_1w = detect_recent_events(hist_df, lookback_weeks=1) if not hist_df.empty else pd.DataFrame()
+recent_events_4w = detect_recent_events(hist_df, lookback_weeks=4) if not hist_df.empty else pd.DataFrame()
+
+
+# ============== 顶部 KPI 状态栏 ==============
+def _market_state(weekly_df: pd.DataFrame) -> str:
+    if weekly_df.empty:
+        return "—"
+    latest_date = weekly_df["trade_date"].max()
+    snap = weekly_df[weekly_df["trade_date"] == latest_date]
+    if snap.empty:
+        return "—"
+    ma20_by_code = (
+        weekly_df.sort_values("trade_date")
+        .groupby("wind_code")["close_hkd"]
+        .apply(lambda s: s.rolling(20, min_periods=10).mean().iloc[-1])
+    )
+    last_by_code = snap.set_index("wind_code")["close_hkd"]
+    aligned = pd.concat([last_by_code, ma20_by_code], axis=1, join="inner")
+    aligned.columns = ["last", "ma20"]
+    above = (aligned["last"] > aligned["ma20"]).mean()
+    return f"牛市 {above*100:.0f}%" if above >= 0.5 else f"熊市 {(1-above)*100:.0f}%"
+
+
+def _granger_dir(gc) -> tuple[str, str]:
+    if not gc:
+        return "—", "—"
+    if gc["f_to_r"]["sig"] and not gc["r_to_f"]["sig"]:
+        return "预期 → 股价", f"p = {gc['f_to_r']['pvalue']:.3f}"
+    if gc["r_to_f"]["sig"] and not gc["f_to_r"]["sig"]:
+        return "股价 → 预期", f"p = {gc['r_to_f']['pvalue']:.3f}"
+    if gc["f_to_r"]["sig"] and gc["r_to_f"]["sig"]:
+        return "双向因果", "均显著"
+    return "未通过", f"min p = {min(gc['f_to_r']['pvalue'], gc['r_to_f']['pvalue']):.3f}"
+
+
+kc1, kc2, kc3, kc4, kc5 = st.columns(5)
+kc1.metric("数据日期", selected_date)
+kc2.metric("覆盖股票数", f"{len(codes_names_df)} 只")
+kc3.metric("市场状态", _market_state(weekly_df))
+g_dir, g_sub = _granger_dir(analysis["gc"] if analysis else None)
+kc4.metric("Granger 主导方向", g_dir, g_sub)
+kc5.metric("近 1 周显著事件", f"{len(recent_events_1w)} 条")
+
+st.divider()
+
+
 # ============== Tab 路由 ==============
 tab_market, tab_stock, tab_rank = st.tabs([
     "📊 市场整体",
@@ -200,18 +295,25 @@ tab_market, tab_stock, tab_rank = st.tabs([
 ])
 
 
-# ============== 缓存渲染：100 只成分股全景 PNG ==============
+PER_PAGE = 12  # 每页 12 只（3 行 × 4 列）
+
+
+# ============== 缓存渲染：成分股全景 PNG（分页） ==============
 @st.cache_data(ttl=3600)
-def render_overview_png(weekly_json: str, date_str: str) -> bytes:
+def render_overview_png(weekly_json: str, date_str: str, page: int, per_page: int) -> bytes:
     weekly_df = pd.read_json(StringIO(weekly_json), orient="split")
     weekly_df["trade_date"] = pd.to_datetime(weekly_df["trade_date"])
     grouped = weekly_df.groupby("wind_code")
-    codes = sorted(weekly_df["wind_code"].unique())
-    n_codes = len(codes)
-    n_cols = 4
-    n_rows = (n_codes + n_cols - 1) // n_cols
+    all_codes = sorted(weekly_df["wind_code"].unique())
 
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(20, 3.5 * n_rows), dpi=200, squeeze=False)
+    start = page * per_page
+    end = min(start + per_page, len(all_codes))
+    codes = all_codes[start:end]
+
+    n_cols = 4
+    n_rows = (len(codes) + n_cols - 1) // n_cols if codes else 1
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(26, 4.6 * n_rows), dpi=180, squeeze=False)
     fig.patch.set_facecolor("white")
 
     for idx, code in enumerate(codes):
@@ -222,65 +324,93 @@ def render_overview_png(weekly_json: str, date_str: str) -> bytes:
         sub = grouped.get_group(code).sort_values("trade_date")
         name = sub["name"].iloc[0] if not sub["name"].isna().all() else code
 
-        ax.plot(sub["trade_date"], sub["netprofit_avg"], color=PALETTE["forecast"], linewidth=1.4, label="预测净利润")
-        ax.set_ylabel("净利润(百万)", color=PALETTE["forecast"], fontsize=9)
-        ax.tick_params(axis="y", labelcolor=PALETTE["forecast"], labelsize=7)
+        ax.plot(sub["trade_date"], sub["netprofit_avg"], color=PALETTE["forecast"], linewidth=2.0, label="预测净利润")
+        ax.set_ylabel("净利润(百万)", color=PALETTE["forecast"], fontsize=12)
+        ax.tick_params(axis="y", labelcolor=PALETTE["forecast"], labelsize=11)
 
         ax2 = ax.twinx()
-        ax2.plot(sub["trade_date"], sub["close_hkd"], color=PALETTE["price"], linewidth=1.4, linestyle="--", label="股价")
-        ax2.set_ylabel("股价(HKD)", color=PALETTE["price"], fontsize=9)
-        ax2.tick_params(axis="y", labelcolor=PALETTE["price"], labelsize=7)
+        ax2.plot(sub["trade_date"], sub["close_hkd"], color=PALETTE["price"], linewidth=2.0, linestyle="--", label="股价")
+        ax2.set_ylabel("股价(HKD)", color=PALETTE["price"], fontsize=12)
+        ax2.tick_params(axis="y", labelcolor=PALETTE["price"], labelsize=11)
 
-        ax.set_title(f"{name}\n{code}", fontsize=11, fontweight="bold", color=PALETTE["title"])
+        ax.set_title(f"{name}  {code}", fontsize=15, fontweight="bold", color=PALETTE["title"], pad=8)
 
-        n_ticks = min(3, len(sub))
+        n_ticks = min(4, len(sub))
         if n_ticks > 0:
             step = max(1, len(sub) // n_ticks)
             tick_positions = sub["trade_date"].iloc[::step]
             ax.set_xticks(tick_positions)
             ax.set_xticklabels(
-                [d.strftime("%m-%d") for d in tick_positions],
-                rotation=45, ha="right", fontsize=6,
+                [d.strftime("%Y-%m") for d in tick_positions],
+                rotation=30, ha="right", fontsize=11,
             )
 
-        ax.grid(True, alpha=0.25, linestyle=":")
+        ax.grid(True, alpha=0.3, linestyle=":")
 
-    for idx in range(n_codes, n_rows * n_cols):
+    for idx in range(len(codes), n_rows * n_cols):
         row = idx // n_cols
         col = idx % n_cols
         axes[row][col].axis("off")
 
-    plt.tight_layout(pad=1.2)
+    plt.tight_layout(pad=2.0)
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight", facecolor="white")
     plt.close(fig)
     return buf.getvalue()
 
 
-# ============== 预热：加载历史 + 跑完所有分析 ==============
-hist_df = get_all_historical_weekly()
-analysis = None
-if not hist_df.empty:
-    with st.spinner("首次加载需 15–30 秒（之后命中缓存）……"):
-        hist_json = hist_df.to_json(orient="split", date_format="iso")
-        static_json = static_df.to_json(orient="split") if not static_df.empty else None
-        analysis = run_full_analysis(hist_json, static_json)
-
-
 # ============================================================
 # Tab 1：市场整体
 # ============================================================
 with tab_market:
-    # ── 成分股全景 ──
+    # ── 本周事件被动表 ──
+    with st.expander(
+        f"📌 最近 4 周触发显著调整的股票（{len(recent_events_4w)} 条）",
+        expanded=not recent_events_4w.empty,
+    ):
+        if recent_events_4w.empty:
+            st.caption("最近 4 周内无股票触发各自 90% / 10% 分位的 ΔF 调整。")
+        else:
+            ev = recent_events_4w.copy()
+            ev["名称"] = ev["代码"].map(code_to_name).fillna(ev["代码"])
+            ev["日期"] = pd.to_datetime(ev["日期"]).dt.strftime("%Y-%m-%d")
+            ev = ev[["日期", "代码", "名称", "事件", "ΔF", "当周收益"]]
+
+            def _color_event(val):
+                if val == "大幅上调":
+                    return f"background-color: {PALETTE['up']}; color: #2C3E50;"
+                if val == "大幅下调":
+                    return f"background-color: {PALETTE['down']}; color: white;"
+                return ""
+
+            styled = ev.style.map(_color_event, subset=["事件"]) \
+                             .format({"ΔF": "{:+.1f}", "当周收益": "{:+.2%}"})
+            st.dataframe(styled, width="stretch", hide_index=True)
+
+    st.divider()
+
+    # ── 成分股全景（分页） ──
     st.subheader("成分股全景")
-    st.caption("100 只股票的预测净利润（橙）与股价（蓝）双 Y 轴")
+    st.caption("预测净利润（橙）vs 股价（蓝）双 Y 轴 · 每页 12 只")
 
     codes = sorted(weekly_df["wind_code"].unique())
     if not codes:
         st.warning("暂无数据。")
     else:
+        n_pages = (len(codes) + PER_PAGE - 1) // PER_PAGE
+        pc1, pc2, _ = st.columns([2, 4, 4])
+        page = pc1.number_input(
+            f"页（共 {n_pages} 页，每页 {PER_PAGE} 只）",
+            min_value=1, max_value=n_pages, value=1, step=1,
+            key="overview_page",
+        )
+        start = (int(page) - 1) * PER_PAGE
+        end = min(start + PER_PAGE, len(codes))
+        pc2.markdown(f"<div style='padding-top:30px;color:#666'>显示第 {start + 1} – {end} 只</div>", unsafe_allow_html=True)
+
         png_bytes = render_overview_png(
-            weekly_df.to_json(orient="split", date_format="iso"), selected_date
+            weekly_df.to_json(orient="split", date_format="iso"),
+            selected_date, int(page) - 1, PER_PAGE,
         )
         st.image(png_bytes, width="stretch")
 
@@ -807,6 +937,28 @@ with tab_rank:
                 "_abs", ascending=False, na_position="last"
             ).drop(columns=["_abs"])
 
+            # 加 sparkline 列：每只股票近 26 周股价
+            def _spark(code, weeks=26):
+                s = (
+                    hist_df[hist_df["wind_code"] == code]
+                    .sort_values("trade_date")["close_hkd"]
+                    .tail(weeks)
+                    .tolist()
+                )
+                return s if s else None
+
+            sorted_df = sorted_df.copy()
+            sorted_df["股价趋势"] = sorted_df["代码"].map(_spark)
+
+            # CSV 下载
+            csv_bytes = sorted_df.drop(columns=["股价趋势"]).to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                "📥 下载 CSV",
+                data=csv_bytes,
+                file_name=f"ranking_{selected_date}.csv",
+                mime="text/csv",
+            )
+
             st.dataframe(
                 sorted_df,
                 width="stretch", hide_index=True,
@@ -819,6 +971,7 @@ with tab_rank:
                     "方向B 前瞻": st.column_config.NumberColumn("方向B 前瞻 (周)", format="%d"),
                     "上调CAR":   st.column_config.NumberColumn("上调 CAR", format="%+.3f"),
                     "下调CAR":   st.column_config.NumberColumn("下调 CAR", format="%+.3f"),
+                    "股价趋势":  st.column_config.LineChartColumn("股价趋势 (近 26 周)", width="medium"),
                 },
             )
 
@@ -835,9 +988,6 @@ with tab_rank:
             rename_map = {
                 "wind_code": "股票代码",
                 "name": "公司名称",
-                "inst_num_2025": "2025 预测机构家数",
-                "netprofit_avg_2025": "2025 预测净利润均值(百万)",
-                "netprofit_median_2025": "2025 预测净利润中值(百万)",
                 "inst_num_2026": "2026 预测机构家数",
                 "netprofit_avg_2026": "2026 预测净利润均值(百万)",
                 "netprofit_median_2026": "2026 预测净利润中值(百万)",
@@ -851,3 +1001,42 @@ with tab_rank:
                     disp[col] = disp[col].fillna(0).astype(int)
             st.dataframe(disp, width="stretch", hide_index=True)
             st.caption("数据单位：百万元人民币 ｜ 来源：Wind 一致预期")
+
+
+# ============================================================
+# 名词解释面板（全局，置于页面最末）
+# ============================================================
+st.divider()
+with st.expander("📖 名词解释 · lag / CAR / Granger / IRF / R² 的金融含义", expanded=False):
+    st.markdown("""
+#### Lag（滞后期 / 领先期）
+- `k > 0`：盈利预期变化在前，股价反应在后 — **预期是领先指标**
+- `k < 0`：股价变化在前，预期跟随 — **股价是领先指标**（市场已 price in）
+- `k = 0`：两者基本同步
+
+#### CAR（累计超额收益, Cumulative Abnormal Return）
+公式：`CAR_t = Σ (个股收益 − 等权市场平均收益)`
+
+事件研究里画的 CAR 曲线，反映"事件发生前后 t 周，该类事件平均能跑赢/跑输市场多少"。
+事件当周 CAR 显著为正 + 持续累积 → 事件具有交易价值。
+
+#### Granger 因果
+统计意义上的"因果"：`X 格兰杰引起 Y`，意味着 X 的历史信息能显著提升对 Y 未来的预测精度。
+**不是物理因果**，仅说明信息领先关系。p < 0.05 视为显著。
+
+#### IRF（脉冲响应函数, Impulse Response Function）
+"X 受到一个标准差冲击后的若干期内，Y 的动态反应路径。"
+配合 95% 置信区间，能识别冲击的方向、峰值时刻、消退速度。
+
+#### 双向回归 R²
+- 方向 A 的 R² 是 `预期变化 → 未来股价收益` 的回归拟合优度
+- 方向 B 的 R² 是 `股价收益 → 未来预期变化` 的回归拟合优度
+
+对比两个方向的 R² 大小，可判断"谁更能预测谁"。
+
+#### Pearson vs Spearman
+- **Pearson** 衡量**线性**相关
+- **Spearman** 衡量**单调**相关（更稳健于异常值）
+
+两者趋势一致 = 关系稳健；分歧大 = 关系存在非线性或受异常点驱动。
+""")

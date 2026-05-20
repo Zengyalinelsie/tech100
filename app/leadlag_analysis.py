@@ -572,3 +572,51 @@ def build_ranking_df(
     out["主导方向"] = out.apply(_direction, axis=1)
 
     return out[cols]
+
+
+def detect_recent_events(
+    hist_df: pd.DataFrame,
+    lookback_weeks: int = 4,
+    top_pct: float = 0.90,
+    bottom_pct: float = 0.10,
+) -> pd.DataFrame:
+    """识别最近 lookback_weeks 周触发各股 90/10 分位 ΔF 的事件。
+
+    返回字段：日期 / 代码 / 事件 / ΔF / 当周收益
+    """
+    if hist_df is None or hist_df.empty:
+        return pd.DataFrame(columns=["日期", "代码", "事件", "ΔF", "当周收益"])
+
+    latest = pd.to_datetime(hist_df["trade_date"]).max()
+    cutoff = latest - pd.Timedelta(weeks=lookback_weeks)
+
+    rows = []
+    for code in hist_df["wind_code"].unique():
+        sub = prepare_stock_series(hist_df, code)
+        if len(sub) < 20:
+            continue
+        q_hi = sub["delta_f"].quantile(top_pct)
+        q_lo = sub["delta_f"].quantile(bottom_pct)
+        recent = sub[sub["trade_date"] >= cutoff]
+        for _, r in recent.iterrows():
+            if pd.isna(r["delta_f"]):
+                continue
+            if r["delta_f"] >= q_hi:
+                rows.append({
+                    "日期": r["trade_date"], "代码": code,
+                    "事件": "大幅上调",
+                    "ΔF": float(r["delta_f"]),
+                    "当周收益": float(r["return_r"]) if pd.notna(r["return_r"]) else np.nan,
+                })
+            elif r["delta_f"] <= q_lo:
+                rows.append({
+                    "日期": r["trade_date"], "代码": code,
+                    "事件": "大幅下调",
+                    "ΔF": float(r["delta_f"]),
+                    "当周收益": float(r["return_r"]) if pd.notna(r["return_r"]) else np.nan,
+                })
+
+    if not rows:
+        return pd.DataFrame(columns=["日期", "代码", "事件", "ΔF", "当周收益"])
+
+    return pd.DataFrame(rows).sort_values("日期", ascending=False).reset_index(drop=True)
