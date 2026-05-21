@@ -107,7 +107,14 @@ def push_to_github():
     if len(changed_files.splitlines()) > 10:
         print(f"    ... 等共 {len(changed_files.splitlines())} 个文件")
 
-    # 3.2 先拉取远程最新（避免冲突）
+    # 3.2 先 add + commit（再 pull-rebase 才不会被 unstaged 阻塞）
+    today = datetime.now().strftime("%Y-%m-%d")
+    commit_msg = f"data: {today} daily update"
+
+    subprocess.run(["git", "add", "-A"], cwd=ROOT, check=True)
+    subprocess.run(["git", "commit", "-m", commit_msg], cwd=ROOT, check=True)
+
+    # 3.3 拉取远程最新（避免推送冲突）
     print("\n  → 同步远程最新代码...")
     pull_result = subprocess.run(
         ["git", "pull", "--rebase", "origin", "main"],
@@ -119,13 +126,6 @@ def push_to_github():
         print(f"⚠️  拉取远程失败：{pull_result.stderr.strip()}")
         print("    请手动解决冲突后再推送。")
         return False
-
-    # 3.3 添加变更并提交
-    today = datetime.now().strftime("%Y-%m-%d")
-    commit_msg = f"data: {today} daily update"
-
-    subprocess.run(["git", "add", "-A"], cwd=ROOT, check=True)
-    subprocess.run(["git", "commit", "-m", commit_msg], cwd=ROOT, check=True)
 
     # 3.4 推送
     push_result = subprocess.run(
