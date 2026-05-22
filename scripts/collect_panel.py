@@ -36,10 +36,13 @@ PANEL_LAST_ROW = PANEL_FIRST_ROW + N_STOCKS - 1      # 102
 PANEL_RANGE = f"A{PANEL_FIRST_ROW}:R{PANEL_LAST_ROW}"  # 代码+日期+16字段
 SENTINEL_CELL = f"R{PANEL_LAST_ROW}"                  # 最后一只市值
 
-MIN_WAIT = 2.0       # 写入后最小等待（让 Wind 启动计算）
-POLL = 1.0           # 轮询间隔
+MIN_WAIT = 5.0       # 写入后最小等待（让 Wind 启动 fetch，单元格变 "Fetch..."）
+POLL = 1.5           # 轮询间隔
 STABLE_NEEDED = 2    # 连续 N 次读数一致才算收敛
-TIMEOUT = 120        # 单个日期最大等待秒
+TIMEOUT = 240        # 单个日期最大等待秒（100×16 公式 fetch 可能较慢）
+
+# Wind 异步取数时的占位符 —— 只要区域里还有这些，说明没算完
+PLACEHOLDERS = ("fetch", "提取", "请求", "loading", "计算中", "正在")
 
 LOG_DIR.mkdir(exist_ok=True)
 logging.basicConfig(
@@ -75,8 +78,20 @@ def has_data(grid) -> bool:
     return non_null > len(grid) * 2  # 至少平均每行 2 个非空
 
 
+def is_fetching(grid) -> bool:
+    """区域里是否还有 Wind 取数占位符（如 "Fetch..."）→ 没算完。"""
+    for row in grid:
+        for v in row:
+            if isinstance(v, str) and any(p in v.lower() for p in PLACEHOLDERS):
+                return True
+    return False
+
+
 def wait_calc(panel_sht) -> bool:
-    """写入 B1 后调用：触发重算 + 轮询直到区域稳定。返回是否收敛。"""
+    """写入 B1 后调用：触发重算 + 轮询直到 fetch 完成且区域稳定。返回是否收敛。
+
+    关键：只要区域里还有 "Fetch..." 占位符就继续等（不被上一周旧值骗）。
+    """
     panel_sht.book.app.calculate()
     time.sleep(MIN_WAIT)
     prev = None
@@ -84,6 +99,11 @@ def wait_calc(panel_sht) -> bool:
     start = time.time()
     while time.time() - start < TIMEOUT:
         cur = panel_sht.range(PANEL_RANGE).value
+        if is_fetching(cur):          # 还在取数 → 重置，继续等
+            stable = 0
+            prev = None
+            time.sleep(POLL)
+            continue
         flat = tuple(tuple("" if v is None else v for v in row) for row in cur)
         if prev is not None and flat == prev and has_data(cur):
             stable += 1
