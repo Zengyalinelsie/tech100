@@ -36,8 +36,8 @@ PANEL_LAST_ROW = PANEL_FIRST_ROW + N_STOCKS - 1      # 102
 PANEL_RANGE = f"A{PANEL_FIRST_ROW}:R{PANEL_LAST_ROW}"  # 代码+日期+16字段
 SENTINEL_CELL = f"R{PANEL_LAST_ROW}"                  # 最后一只市值
 
-MIN_WAIT = 5.0       # 写入后最小等待（让 Wind 启动 fetch，单元格变 "Fetch..."）
-POLL = 1.5           # 轮询间隔
+MIN_WAIT = 3.0       # 写入后最小等待（让 Wind 启动 fetch，单元格变 "Fetch..."）
+POLL = 1.0           # 轮询间隔
 STABLE_NEEDED = 2    # 连续 N 次读数一致才算收敛
 TIMEOUT = 600        # 单个日期最大等待秒（1800 公式 fetch 可能要 3-5 分钟）
 
