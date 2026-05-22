@@ -39,7 +39,7 @@ SENTINEL_CELL = f"R{PANEL_LAST_ROW}"                  # 最后一只市值
 MIN_WAIT = 5.0       # 写入后最小等待（让 Wind 启动 fetch，单元格变 "Fetch..."）
 POLL = 1.5           # 轮询间隔
 STABLE_NEEDED = 2    # 连续 N 次读数一致才算收敛
-TIMEOUT = 240        # 单个日期最大等待秒（100×16 公式 fetch 可能较慢）
+TIMEOUT = 600        # 单个日期最大等待秒（1800 公式 fetch 可能要 3-5 分钟）
 
 # Wind 异步取数时的占位符 —— 只要区域里还有这些，说明没算完
 PLACEHOLDERS = ("fetch", "提取", "请求", "loading", "计算中", "正在")
@@ -207,11 +207,13 @@ def main():
         return
 
     log.info(f"打开 {TEMPLATE} ...")
-    app = xw.App(visible=False)
+    # visible=True 必需：Wind 加载项(windfunc.xlam)的异步取数靠后台回调写回单元格，
+    # 隐藏/关屏幕刷新的自动化 Excel 里该回调不触发，单元格会永远停在 "Fetch..."。
+    app = xw.App(visible=True)
     app.display_alerts = False
-    app.screen_updating = False
     try:
-        wb = app.books.open(str(TEMPLATE))
+        wb = app.books.open(str(TEMPLATE), update_links=False)
+        wb.app.calculation = "automatic"
         panel = wb.sheets["panel"]
         bench = wb.sheets["benchmark"]
         static = wb.sheets["static_info"]
