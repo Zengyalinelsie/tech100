@@ -103,9 +103,15 @@
 ### 5. template.xlsx 现状（最新发现）
 
 **已经被扩展过**，远超我之前的认知：
-- 时间序列 `A11:G395` = **385 行 ≈ 7.4 年周频**（不是 89 行）
+- 当前实际状态：时间序列 `A11:G395` = **385 行 ≈ 7.4 年周频**
 - 列结构：A 日期 | B FY2026 均值 | C 股价 | D 机构数 | E 标准差 | F 中值 | G FY2025 均值
-- **6 个时间序列字段**已经在 Excel 公式里，但**只有 B/C 两列被 update_wind_data.py 读取入库**
+- 但 ⚠ 公式用了**固定年度 2026**，早年日期会拉不到数据 — 是 v2 改造的核心 bug
+
+**V5 目标态**（见 [DATA_PROCUREMENT.md](./DATA_PROCUREMENT.md) v2）：
+- `A11:L1311` = **1300 行 ≈ 5 年日频**
+- 11 个字段（FY1 5 个 + FY2 5 个 + 收盘价）
+- 公式用 **`YEAR($A11)` 滚动年度**（不再固定 2026）
+- 加 `_meta` sheet 列出 100 个标的
 
 ---
 
@@ -152,16 +158,20 @@
                        ▼
 ┌──────────────────────────────────────────────────────┐
 │ V5 · 数据补强（进行中）                                │
-│   目标：把数据从 1.7 年扩到 5-7 年，把字段从 2 扩到 6 │
+│   目标：把数据从 1.7 年扩到 5 年，从 2 字段扩到 11 字段│
 │   ────────────────────────────────────────────────  │
-│   ① 修 template.xlsx 的 B4 公式 bug                  │
-│   ② 验证早年（2019-2021）Wind 港股一致预期可用性     │
-│   ③ 开 quant-v5 分支                                 │
-│   ④ ALTER TABLE 加 4 列（inst_num/std/median/fy25）  │
-│   ⑤ 改 update_wind_data.py 读 A11:G395              │
-│   ⑥ 写 backfill_history.py 一次性回拉 7 年           │
-│   ⑦ 修 dashboard get_all_historical_weekly 去重 bug  │
-│   ⑧ dashboard 暴露新字段（分歧度/机构数作因子）       │
+│   ① ★ 重新设计公式：固定 FY → 滚动 YEAR($A11)         │
+│   ② ★ 频率从周频改为日频                              │
+│   ③ ★ 同时拉 FY1 + FY2 双预期                         │
+│   ④ 13 个 Wind 公式验证（详见 DATA_PROCUREMENT v2）   │
+│   ⑤ 开 quant-v5 分支                                 │
+│   ⑥ 新建 daily_data_v2 / static_info /                │
+│      announce_events / benchmark 表                  │
+│   ⑦ 改 template.xlsx：A11:L1311 + 加 _meta sheet     │
+│   ⑧ 改 update_wind_data.py 读 A11:L1311              │
+│   ⑨ 写 backfill_history.py 一次性回拉 5 年            │
+│   ⑩ 修 dashboard get_all_historical_weekly 去重 bug   │
+│   ⑪ dashboard 暴露 FY1/FY2 双 X 变量                  │
 └──────────────────────────────────────────────────────┘
                        │
                        ▼
@@ -193,12 +203,12 @@
 
 | 序号 | 阻塞点 | 解决方式 | 谁做 | 耗时 |
 |------|--------|---------|------|------|
-| 1 | template.xlsx 的 B4 公式 bug（写错为 instnum_np 用 $A$1） | Excel 改一格公式 | 用户 | 30 秒 |
-| 2 | Wind 港股一致预期能回拉多久未验证 | 在 template 里看 A300/A395 那天 B/C/D 是否有值 | 用户 | 2 分钟 |
+| 1 | 13 个 Wind 公式可用性未验证（见 DATA_PROCUREMENT v2 第十章） | 在 template.xlsx 跑 13 个测试公式 | 用户 | 30 分钟 |
+| 2 | 滚动 FY 公式在早年（2021）能否拉到 FY1/FY2（验证 #6 #7） | 同上，是 13 个里最关键的 2 个 | 用户 | 含在 30 分钟内 |
 | 3 | 新分支 `quant-v5` 没开 | git checkout -b | Claude | 10 秒 |
-| 4 | schema 改造方案没定 | ALTER TABLE 加 4 列 vs 新建表 vs 用 wide 表 | Claude 写 PR | 30 分钟 |
+| 4 | schema 改造方案没定 | 新建 daily_data_v2 表（与老 weekly_data 并存） | Claude 写 PR | 30 分钟 |
 
-**1 + 2 由用户完成后，Claude 在 V5 分支上一口气把 3/4/5/6/7/8 都做了。**
+**1 + 2 由用户完成后，Claude 在 V5 分支上一口气把 3/4/5/6/7/8/9/10/11 都做了。**
 
 ---
 
@@ -211,4 +221,4 @@
 
 ---
 
-*最后更新：2026-05-21 ｜ 作者：用户 + Claude*
+*最后更新：2026-05-22 (v1.1：V5 升级为滚动 FY + 日频) ｜ 作者：用户 + Claude*
