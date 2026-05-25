@@ -42,15 +42,19 @@ UNIVERSE = [
     ("HSCI.HI",     "恒生综合",         "HK", "index", "全港股综合"),
     ("HSCNCI.HI",   "恒生消费",         "HK", "index", "消费板块"),
 
-    # === 港股恒生综合行业(8 个,P0 验证后可能调整代码)===
-    ("HSCIIN10.HI", "恒生综合 能源业",    "HK", "industry", "代码待 P0 验证"),
-    ("HSCIIN15.HI", "恒生综合 原材料业",  "HK", "industry", "代码待 P0 验证"),
-    ("HSCIIN20.HI", "恒生综合 工业",      "HK", "industry", "代码待 P0 验证"),
-    ("HSCIIN25.HI", "恒生综合 非必需消费","HK", "industry", "代码待 P0 验证"),
-    ("HSCIIN30.HI", "恒生综合 必需消费",  "HK", "industry", "代码待 P0 验证"),
-    ("HSCIIN35.HI", "恒生综合 医疗保健",  "HK", "industry", "代码待 P0 验证"),
-    ("HSCIIN40.HI", "恒生综合 金融业",    "HK", "industry", "代码待 P0 验证"),
-    ("HSCIIN45.HI", "恒生综合 资讯科技业","HK", "industry", "代码待 P0 验证"),
+    # === 港股恒生综合行业(12 个,正确代码,P0 已用 AI 文档查证)===
+    ("HSCI10.HI",  "恒生综合 综合企业",     "HK", "industry", ""),
+    ("HSCI20.HI",  "恒生综合 金融业",       "HK", "industry", ""),
+    ("HSCIUT.HI",  "恒生综合 公用事业",     "HK", "industry", ""),
+    ("HSCITL.HI",  "恒生综合 电讯业",       "HK", "industry", ""),
+    ("HSCIMT.HI",  "恒生综合 原材料业",     "HK", "industry", ""),
+    ("HSCICD.HI",  "恒生综合 非必需消费",   "HK", "industry", ""),
+    ("HSCIFD.HI",  "恒生综合 必需消费",     "HK", "industry", ""),
+    ("HSCIHC.HI",  "恒生综合 医疗保健业",   "HK", "industry", ""),
+    ("HSCIIN.HI",  "恒生综合 工业",         "HK", "industry", ""),
+    ("HSCIOG.HI",  "恒生综合 能源业",       "HK", "industry", ""),
+    ("HSCIIT.HI",  "恒生综合 资讯科技业",   "HK", "industry", ""),
+    ("HSCIRE.HI",  "恒生综合 地产建筑业",   "HK", "industry", ""),
 ]
 
 

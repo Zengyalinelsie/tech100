@@ -202,9 +202,9 @@ st.divider()
 
 
 # ============== Tab 路由 ==============
-tab_market, tab_stock, tab_rank, tab_strat, tab_screen, tab_ref = st.tabs([
+tab_market, tab_stock, tab_rank, tab_strat, tab_screen = st.tabs([
     "📊 市场整体", "🔍 个股深度", "🏆 100 家排行榜", "📈 策略回测",
-    "🧮 多因子选股", "📑 参考估值表",
+    "🧮 多因子选股",
 ])
 
 
@@ -641,47 +641,3 @@ with tab_screen:
             if not (icc.get("ic_mean", 0) > 0.02):
                 st.caption("注：横截面 IC 接近 0 时,多空 alpha 未稳定;多头相对基准 IR 仍可参考。结果仅供研究。")
 
-
-# ============================================================
-# Tab 6: 参考估值表(分析师原始估值表,静态)
-# ============================================================
-SYSTEM_DIR = ROOT / "system"
-
-
-@st.cache_data(ttl=3600, show_spinner="加载参考估值表…")
-def list_ref_files():
-    return sorted(p.name for p in SYSTEM_DIR.glob("*.xlsx")
-                  if "Equity research" not in p.name and not p.name.startswith("~"))
-
-
-@st.cache_data(ttl=3600, show_spinner="读取 sheet…")
-def load_ref_sheet(fname: str, sheet: str):
-    df = pd.read_excel(SYSTEM_DIR / fname, sheet_name=sheet, header=None)
-    df = df.dropna(axis=0, how="all").dropna(axis=1, how="all")
-    return df.astype(str).replace({"nan": "", "None": ""})
-
-
-@st.cache_data(ttl=3600)
-def ref_sheet_names(fname: str):
-    import openpyxl
-    wb = openpyxl.load_workbook(SYSTEM_DIR / fname, read_only=True)
-    names = wb.sheetnames
-    wb.close()
-    return names
-
-
-with tab_ref:
-    st.subheader("参考估值表(分析师原始表)")
-    st.warning("⚠️ 这是分析师提供的**静态快照**(部分数据截至 2021 年),非每日更新,仅供版式与口径参考。"
-               "「🧮 多因子选股」页是用我们的 live 数据按同一思路复刻的活表。")
-    files = list_ref_files()
-    if not files:
-        st.info("system/ 目录下未找到估值表文件。")
-    else:
-        f = st.selectbox("文件", files, key="ref_file")
-        sheets = ref_sheet_names(f)
-        sh = st.selectbox("Sheet", sheets, key="ref_sheet")
-        try:
-            st.dataframe(load_ref_sheet(f, sh), width="stretch", height=560)
-        except Exception as e:
-            st.error(f"读取失败：{e}")
