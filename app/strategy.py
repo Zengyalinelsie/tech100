@@ -7,12 +7,20 @@
 - 三条线：多头 / 空头（空头簿损益）/ 多空价差（多−空，资金中性）+ 恒生科技基准
 - 交易成本：每次换仓按换手率扣 cost_bps（双边）
 
+借鉴：
+- 股池清洗（可交易 + 流动性 + 退市保险栓）：可交易/流动性用本仓 amount/close；退市读
+  config/universe_status.csv（来自 INF stock_lifecycle，见 scripts/build_universe.py）
+- n_drop 换手控制：思路借自 Qlib TopkDropoutStrategy（只换最弱 n_drop 只，降换手降成本）
+- 诊断：分层 IC / 年化 ICIR / 信息比率 IR（借自 Qlib evaluate / eva.alpha）
+
 用法：
     from strategy import backtest, latest_signal
-    res = backtest(x_col="fy1_rev_norm", hold_weeks=1)   # res["nav"], res["metrics"], res["trades"]
-    buy, sell = latest_signal(x_col="fy1_rev_norm")
+    res = backtest(x_col="fy1_rev_norm", hold_weeks=1, n_drop=3)
+    buy_sell = latest_signal(x_col="fy1_rev_norm")
 """
 from __future__ import annotations
+
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -20,32 +28,89 @@ import pandas as pd
 from factors import build_factor_panel, attach_industry
 
 WEEKS_PER_YEAR = 52
+UNIVERSE_STATUS = Path(__file__).parent.parent / "config" / "universe_status.csv"
+LIQ_PCT = 0.10        # 流动性下限：剔除滚动 ADTV 最低的 10%
+ADTV_WIN = 12         # 滚动 ADTV 窗口（周）
 
 
-def _valid(fac: pd.DataFrame, x_col: str) -> pd.DataFrame:
-    """只保留信号、收盘价、市值齐全、且有机构覆盖的可交易行。"""
+def _load_delist() -> dict:
+    if UNIVERSE_STATUS.exists():
+        u = pd.read_csv(UNIVERSE_STATUS)
+        d = pd.to_datetime(u["delist_date"], errors="coerce")
+        return dict(zip(u["wind_code"], d))
+    return {}
+
+
+def _prepare(fac: pd.DataFrame, liq_pct: float = LIQ_PCT) -> pd.DataFrame:
+    """给面板加可交易/流动性/退市标记（一次性，供后续按日筛选）。"""
+    if "eligible_base" in fac.columns:
+        return fac
+    fac = fac.sort_values(["wind_code", "trade_date"]).copy()
+    fac["adtv"] = fac.groupby("wind_code")["amount"].transform(
+        lambda s: s.rolling(ADTV_WIN, min_periods=4).mean())
+    thr = fac.groupby("trade_date")["adtv"].transform(lambda s: s.quantile(liq_pct))
+    liquid = fac["adtv"] >= thr
+    tradable = (fac["close_hkd"] > 0) & (fac["amount"] > 0)
+    delist = _load_delist()
+    dl = fac["wind_code"].map(delist)
+    not_delisted = dl.isna() | (fac["trade_date"] < dl)
+    fac["eligible_base"] = tradable & liquid.fillna(False) & not_delisted
+    return fac
+
+
+def _eligible(fac: pd.DataFrame, x_col: str) -> pd.DataFrame:
+    """可交易 + 流动 + 未退市 + 信号/市值/机构覆盖齐全。"""
+    fac = _prepare(fac)
     inst_col = "fy1_instnum" if x_col.startswith("fy1") else "fy2_instnum"
     m = (
-        fac[x_col].notna()
-        & fac["close_hkd"].notna()
+        fac["eligible_base"]
+        & fac[x_col].notna()
         & fac["mkt_cap"].notna()
-        & (fac.get(inst_col, 1) > 0)
+        & (fac[inst_col].fillna(0) > 0)
     )
     return fac[m]
 
 
+def _topk(fac: pd.DataFrame, top_pct: float) -> int:
+    return max(1, int(round(top_pct * fac["wind_code"].nunique())))
+
+
+def _dropout(scores: pd.Series, prev: list, topk: int, n_drop: int) -> list:
+    """Qlib 风格 dropout 选 topk：保留上期、只丢合并池最弱 n_drop 只、买最强新票补回。
+
+    scores 越大越想要（做空时传 -signal）。prev 为空时直接取 topk（首期全建仓）。
+    """
+    scores = scores.dropna().sort_values(ascending=False)
+    if scores.empty:
+        return []
+    ranked = list(scores.index)
+    last = [c for c in prev if c in scores.index]          # 上期仍合格
+    last = list(scores.reindex(last).sort_values(ascending=False).index)
+    if not last:
+        return ranked[:topk]
+    need = max(0, n_drop + topk - len(last))
+    today = [c for c in ranked if c not in set(last)][:need]
+    comb = list(scores.reindex(last + today).sort_values(ascending=False).index)
+    bottom = set(comb[-n_drop:]) if n_drop > 0 else set()
+    sell = [c for c in last if c in bottom]
+    buy = today[: len(sell) + topk - len(last)]
+    new = [c for c in last if c not in set(sell)] + buy
+    return new[:topk]
+
+
 def select(fac: pd.DataFrame, x_col: str, date, top_pct: float = 0.2):
-    """某周横截面：信号最强 top_pct = 多头，最弱 top_pct = 空头（等权）。"""
+    """某周横截面：信号最强 topk = 多头，最弱 topk = 空头（等权，已做股池清洗）。"""
     date = pd.Timestamp(date)
-    cs = _valid(fac, x_col)
+    fac = _prepare(fac)
+    cs = _eligible(fac, x_col)
+    topk = _topk(fac, top_pct)
     cs = cs[cs["trade_date"] == date].copy()
     if cs.empty:
-        return {"date": date, "long": [], "short": []}
+        return {"date": date, "long": [], "short": [], "n": topk, "pool": 0}
     cs = cs.sort_values(x_col, ascending=False)
-    n = max(1, int(round(len(cs) * top_pct)))
-    longs = cs.head(n)["wind_code"].tolist()
-    shorts = cs.tail(n)["wind_code"].tolist()
-    return {"date": date, "long": longs, "short": shorts, "n": n, "pool": len(cs)}
+    longs = cs.head(topk)["wind_code"].tolist()
+    shorts = cs.tail(topk)["wind_code"].tolist()
+    return {"date": date, "long": longs, "short": shorts, "n": topk, "pool": len(cs)}
 
 
 def _bench_returns(conn=None) -> pd.Series:
@@ -69,25 +134,53 @@ def _max_drawdown(nav: pd.Series) -> float:
     return float((nav / peak - 1).min())
 
 
-def _metrics(weekly: pd.Series, nav: pd.Series) -> dict:
+def _metrics(weekly: pd.Series, nav: pd.Series, bench: pd.Series | None = None) -> dict:
     weekly = weekly.dropna()
+    keys = ["total_ret", "cagr", "ann_vol", "sharpe", "max_dd", "win_rate", "ir"]
     if len(weekly) < 2:
-        return {k: np.nan for k in
-                ["total_ret", "cagr", "ann_vol", "sharpe", "max_dd", "win_rate"]}
+        return {k: np.nan for k in keys}
     n = len(weekly)
-    total = float(nav.iloc[-1] - 1)
-    cagr = float(nav.iloc[-1] ** (WEEKS_PER_YEAR / n) - 1)
     vol = float(weekly.std(ddof=1) * np.sqrt(WEEKS_PER_YEAR))
     mean_a = float(weekly.mean() * WEEKS_PER_YEAR)
-    sharpe = mean_a / vol if vol > 0 else np.nan
+    ir = np.nan
+    if bench is not None:
+        ex = (weekly - bench.reindex(weekly.index)).dropna()
+        te = ex.std(ddof=1)
+        ir = float(ex.mean() / te * np.sqrt(WEEKS_PER_YEAR)) if te > 0 else np.nan
     return {
-        "total_ret": total,
-        "cagr": cagr,
+        "total_ret": float(nav.iloc[-1] - 1),
+        "cagr": float(nav.iloc[-1] ** (WEEKS_PER_YEAR / n) - 1),
         "ann_vol": vol,
-        "sharpe": sharpe,
+        "sharpe": mean_a / vol if vol > 0 else np.nan,
         "max_dd": _max_drawdown(nav),
         "win_rate": float((weekly > 0).mean()),
+        "ir": ir,
     }
+
+
+def _rolling_ic(fac: pd.DataFrame, x_col: str, horizons=(1, 2, 4)) -> dict:
+    """分层 IC：信号 vs 前向 h 周累计收益的截面 Spearman，按日平均。
+
+    返回 {"by_h": {h: mean_ic}, "series1": 每日 h=1 的 IC Series}。
+    """
+    elig = _eligible(fac, x_col)
+    sig = elig.pivot_table(index="trade_date", columns="wind_code", values=x_col)
+    close = fac.pivot_table(index="trade_date", columns="wind_code", values="close_hkd")
+    by_h, series1 = {}, pd.Series(dtype=float)
+    for h in horizons:
+        fwd = close.shift(-h) / close - 1
+        recs = {}
+        for dt in sig.index:
+            if dt not in fwd.index:
+                continue
+            pair = pd.concat([sig.loc[dt], fwd.loc[dt]], axis=1).dropna()
+            if len(pair) > 5:
+                recs[dt] = pair.iloc[:, 0].corr(pair.iloc[:, 1], method="spearman")
+        s = pd.Series(recs)
+        by_h[h] = float(s.mean()) if len(s) else np.nan
+        if h == 1:
+            series1 = s
+    return {"by_h": by_h, "series1": series1}
 
 
 def backtest(
@@ -96,51 +189,53 @@ def backtest(
     hold_weeks: int = 1,
     top_pct: float = 0.2,
     cost_bps: float = 30.0,
+    n_drop: int = 3,
     start: str | None = None,
 ) -> dict:
-    """非重叠 hold_weeks 周换仓的多空回测。返回 nav / weekly / metrics / trades / ic。"""
+    """非重叠 hold_weeks 周换仓的多空回测（带股池清洗 + n_drop 降换手）。"""
     if fac is None:
         fac = build_factor_panel()
     fac = fac.copy()
     fac["trade_date"] = pd.to_datetime(fac["trade_date"])
     if start:
         fac = fac[fac["trade_date"] >= pd.Timestamp(start)]
+    fac = _prepare(fac)
 
     dates = sorted(fac["trade_date"].unique())
     ret_lookup = fac.set_index(["trade_date", "wind_code"])["ret"]
+    topk = _topk(fac, top_pct)
     cost = cost_bps / 1e4
 
-    rows, trades, ics = [], [], []
-    prev_long, prev_short = set(), set()
+    # 每日合格信号（含清洗），供 dropout 选股
+    elig = _eligible(fac, x_col)
+    sig_by_date = {d: g.set_index("wind_code")[x_col]
+                   for d, g in elig.groupby("trade_date")}
+
+    rows, trades, turns_l, turns_s = [], [], [], []
+    prev_long, prev_short = [], []
 
     i = 0
     while i < len(dates) - 1:
         t = dates[i]
-        sel = select(fac, x_col, t, top_pct)
-        longs, shorts = sel["long"], sel["short"]
+        scores = sig_by_date.get(t)
+        if scores is None or scores.empty:
+            i += 1
+            continue
+        longs = _dropout(scores, prev_long, topk, n_drop)
+        shorts = _dropout(-scores, prev_short, topk, n_drop)
         if not longs or not shorts:
             i += 1
             continue
 
-        # IC：信号(t) vs 前向 1 周收益(t+1)，全池 Spearman
-        nxt = dates[i + 1]
-        sig_cs = _valid(fac, x_col)
-        sig_cs = sig_cs[sig_cs["trade_date"] == t].set_index("wind_code")[x_col]
-        fwd = ret_lookup.reindex([(nxt, c) for c in sig_cs.index])
-        fwd.index = sig_cs.index
-        pair = pd.concat([sig_cs, fwd], axis=1, keys=["sig", "fwd"]).dropna()
-        if len(pair) > 5:
-            ics.append({"date": t, "ic": pair["sig"].corr(pair["fwd"], method="spearman")})
-
-        # 换手成本（与上次篮子比较，单边换手率）
-        turn_l = len(set(longs) - prev_long) / len(longs) if prev_long else 1.0
-        turn_s = len(set(shorts) - prev_short) / len(shorts) if prev_short else 1.0
-        prev_long, prev_short = set(longs), set(shorts)
+        turn_l = len(set(longs) - set(prev_long)) / len(longs)
+        turn_s = len(set(shorts) - set(prev_short)) / len(shorts)
+        turns_l.append(turn_l)
+        turns_s.append(turn_s)
+        prev_long, prev_short = longs, shorts
 
         trades.append({"trade_date": t, "side": "LONG", "codes": ",".join(longs)})
         trades.append({"trade_date": t, "side": "SHORT", "codes": ",".join(shorts)})
 
-        # 持有窗口内逐周结算（篮子固定，等权）
         for step in range(1, hold_weeks + 1):
             j = i + step
             if j >= len(dates):
@@ -150,15 +245,12 @@ def backtest(
             sr = ret_lookup.reindex([(d, c) for c in shorts]).mean()
             lr = 0.0 if pd.isna(lr) else float(lr)
             sr = 0.0 if pd.isna(sr) else float(sr)
-            # 仅换仓周（step==1）扣成本
             c_l = cost * turn_l if step == 1 else 0.0
             c_s = cost * turn_s if step == 1 else 0.0
-            long_ret = lr - c_l
-            short_ret = -sr - c_s                 # 空头簿：标的跌 → 赚
-            ls_ret = (lr - sr) - (c_l + c_s)      # 多空价差
-            rows.append({"trade_date": d, "long_ret": long_ret,
-                         "short_ret": short_ret, "ls_ret": ls_ret,
-                         "bench_basis": sr})
+            rows.append({"trade_date": d,
+                         "long_ret": lr - c_l,
+                         "short_ret": -sr - c_s,
+                         "ls_ret": (lr - sr) - (c_l + c_s)})
         i += hold_weeks
 
     wk = pd.DataFrame(rows).set_index("trade_date").sort_index()
@@ -173,61 +265,66 @@ def backtest(
     })
 
     metrics = pd.DataFrame({
-        "多头": _metrics(wk["long_ret"], nav["多头"]),
-        "空头": _metrics(wk["short_ret"], nav["空头"]),
-        "多空": _metrics(wk["ls_ret"], nav["多空"]),
-        "恒生科技": _metrics(wk["bench_ret"], nav["恒生科技"]),
+        "多头": _metrics(wk["long_ret"], nav["多头"], bench),
+        "空头": _metrics(wk["short_ret"], nav["空头"], bench),
+        "多空": _metrics(wk["ls_ret"], nav["多空"], bench),
+        "恒生科技": _metrics(wk["bench_ret"], nav["恒生科技"], None),
     }).T
 
-    ic_df = pd.DataFrame(ics)
+    # 诊断：分层 IC + 年化 ICIR
+    ric = _rolling_ic(fac, x_col)
+    s1 = ric["series1"]
     ic_summary = {}
-    if not ic_df.empty:
+    if len(s1) > 1:
+        std = s1.std(ddof=1)
         ic_summary = {
-            "ic_mean": float(ic_df["ic"].mean()),
-            "ic_ir": float(ic_df["ic"].mean() / ic_df["ic"].std(ddof=1))
-            if ic_df["ic"].std(ddof=1) > 0 else np.nan,
-            "ic_pos_rate": float((ic_df["ic"] > 0).mean()),
+            "ic_mean": float(s1.mean()),
+            "ic_ir": float(s1.mean() / std * np.sqrt(WEEKS_PER_YEAR)) if std > 0 else np.nan,
+            "ic_pos_rate": float((s1 > 0).mean()),
+            "rolling_ic": {int(h): v for h, v in ric["by_h"].items()},
+            "turnover_long": float(np.mean(turns_l)) if turns_l else np.nan,
+            "turnover_short": float(np.mean(turns_s)) if turns_s else np.nan,
         }
 
     return {
         "nav": nav, "weekly": wk, "metrics": metrics,
-        "trades": pd.DataFrame(trades), "ic": ic_df, "ic_summary": ic_summary,
-        "params": {"x_col": x_col, "hold_weeks": hold_weeks,
-                   "top_pct": top_pct, "cost_bps": cost_bps},
+        "trades": pd.DataFrame(trades), "ic": s1.rename_axis("date").reset_index(name="ic"),
+        "ic_summary": ic_summary,
+        "params": {"x_col": x_col, "hold_weeks": hold_weeks, "top_pct": top_pct,
+                   "cost_bps": cost_bps, "n_drop": n_drop, "topk": topk},
     }
 
 
 def latest_signal(fac: pd.DataFrame | None = None, x_col: str = "fy1_rev_norm",
                   top_pct: float = 0.2) -> pd.DataFrame:
-    """最新一周的买入(LONG)/卖出(SHORT)清单，含名称、信号值、参考收盘价。"""
+    """最新一周的买入(LONG)/卖出(SHORT)目标清单（已做股池清洗）。"""
     if fac is None:
         fac = build_factor_panel()
     if "name" not in fac.columns:
         fac = attach_industry(fac)
     fac["trade_date"] = pd.to_datetime(fac["trade_date"])
+    fac = _prepare(fac)
     last = fac["trade_date"].max()
     sel = select(fac, x_col, last, top_pct)
     cs = fac[fac["trade_date"] == last].set_index("wind_code")
 
     out = []
     weight = 1.0 / sel.get("n", 1)
-    for code in sel["long"]:
-        r = cs.loc[code]
-        out.append([last.date(), code, r["name"], "LONG", round(weight, 4),
-                    round(float(r[x_col]), 8), round(float(r["close_hkd"]), 3)])
-    for code in sel["short"]:
-        r = cs.loc[code]
-        out.append([last.date(), code, r["name"], "SHORT", round(weight, 4),
-                    round(float(r[x_col]), 8), round(float(r["close_hkd"]), 3)])
+    for side, codes in [("LONG", sel["long"]), ("SHORT", sel["short"])]:
+        for code in codes:
+            r = cs.loc[code]
+            out.append([last.date(), code, r["name"], side, round(weight, 4),
+                        round(float(r[x_col]), 8), round(float(r["close_hkd"]), 3)])
     return pd.DataFrame(out, columns=["trade_date", "wind_code", "name", "side",
                                       "target_weight", "signal", "ref_close_hkd"])
 
 
 if __name__ == "__main__":
-    res = backtest(x_col="fy1_rev_norm", hold_weeks=1)
+    res = backtest(x_col="fy1_rev_norm", hold_weeks=1, n_drop=3)
     print("=== 指标 ===")
     print(res["metrics"].round(3).to_string())
-    print("\n=== IC ===", res["ic_summary"])
+    print("\n=== IC / 换手 ===", {k: (round(v, 4) if isinstance(v, float) else v)
+                                  for k, v in res["ic_summary"].items()})
     print("\n=== NAV 末值 ===")
     print(res["nav"].iloc[-1].round(3).to_string())
     print("\n=== 本周选股(前6行) ===")

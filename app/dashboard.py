@@ -62,10 +62,11 @@ def run_analysis(fac_json: str, x_col: str):
 
 
 @st.cache_data(ttl=3600, show_spinner="跑策略回测…")
-def run_backtest(fac_json: str, x_col: str, hold: int, top_pct: float, cost_bps: float):
+def run_backtest(fac_json: str, x_col: str, hold: int, top_pct: float, cost_bps: float, n_drop: int):
     fac = pd.read_json(StringIO(fac_json), orient="split")
     fac["trade_date"] = pd.to_datetime(fac["trade_date"])
-    res = backtest(fac, x_col=x_col, hold_weeks=hold, top_pct=top_pct, cost_bps=cost_bps)
+    res = backtest(fac, x_col=x_col, hold_weeks=hold, top_pct=top_pct,
+                   cost_bps=cost_bps, n_drop=n_drop)
     sig = latest_signal(fac, x_col=x_col, top_pct=top_pct)
     return res, sig
 
@@ -400,14 +401,17 @@ with tab_strat:
         "每周排序：信号最强 top% 买入（多头）、最弱 top% 卖出（空头）。"
         "三条线 = 多头 / 空头簿损益 / 多空价差，基准 = 恒生科技。"
         "**点位正确**：t 时点信号 → t+1 起结算，无前视。"
+        "已做股池清洗（可交易+流动性，退市保险栓来自 INF）；n_drop = 每期最多换几只（借 Qlib，降换手降成本）。"
     )
 
-    sc1, sc2, sc3 = st.columns(3)
+    sc1, sc2, sc3, sc4 = st.columns(4)
     hold = sc1.slider("持有/换仓周数", 1, 8, 1)
     top_pct = sc2.slider("买卖各占池比例", 0.05, 0.40, 0.20, step=0.05)
     cost_bps = sc3.slider("单边交易成本 (bps)", 0, 100, 30, step=5)
+    topk_est = max(1, int(round(top_pct * 100)))
+    n_drop = sc4.slider("n_drop（每期换仓上限）", 1, topk_est, min(3, topk_est))
 
-    res, sig = run_backtest(fac_json, x_col, hold, top_pct, float(cost_bps))
+    res, sig = run_backtest(fac_json, x_col, hold, top_pct, float(cost_bps), n_drop)
     nav, metrics, ic = res["nav"], res["metrics"], res["ic_summary"]
 
     if nav.empty:
@@ -433,25 +437,36 @@ with tab_strat:
 
         ic_mean = ic.get("ic_mean", float("nan"))
         ic_pos = ic.get("ic_pos_rate", float("nan"))
+        ic_ir = ic.get("ic_ir", float("nan"))
+        turn_l = ic.get("turnover_long", float("nan"))
         ls = metrics.loc["多空"]
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("多空累计收益", f"{ls['total_ret']*100:+.1f}%")
-        m2.metric("多空 Sharpe", f"{ls['sharpe']:+.2f}")
-        m3.metric("多空最大回撤", f"{ls['max_dd']*100:.1f}%")
-        m4.metric("IC 均值", f"{ic_mean:+.4f}", f"正率 {ic_pos*100:.0f}%")
+        lng = metrics.loc["多头"]
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
+        m1.metric("多头累计", f"{lng['total_ret']*100:+.1f}%", f"IR {lng['ir']:+.2f}")
+        m2.metric("多空累计", f"{ls['total_ret']*100:+.1f}%")
+        m3.metric("多空 Sharpe", f"{ls['sharpe']:+.2f}")
+        m4.metric("最大回撤(多空)", f"{ls['max_dd']*100:.1f}%")
+        m5.metric("IC 均值", f"{ic_mean:+.4f}", f"ICIR {ic_ir:+.2f}")
+        m6.metric("换手/期", f"{turn_l*100:.0f}%", f"正率 {ic_pos*100:.0f}%")
 
-        if not (ic_mean > 0.02 and ls["sharpe"] > 0):
+        if not (ic_mean > 0.02):
             st.warning(
-                "⚠️ 当前信号在该参数下 **未显现可交易 alpha**（IC≈0 / Sharpe≤0）。"
-                "这与项目 CHARTER「可交易因子尚未就绪」一致 — 建议先加分歧度过滤、"
-                "用最优 lag、按行业切片再精炼，不要据此投入真金。"
+                "⚠️ 横截面信号 IC≈0，**多空 alpha 尚未证明**（与 CHARTER「可交易因子尚未就绪」一致）。"
+                f"但清洗股池 + 低换手(n_drop={n_drop}) 后，多头 sleeve 相对恒生科技 IR={lng['ir']:+.2f}。"
+                "下一步建议：加分歧度过滤 / 用最优 lag / 行业切片，再决定是否投入真金。"
             )
+
+        rolling = ic.get("rolling_ic", {})
+        if rolling:
+            st.caption("分层 IC（信号 vs 前向收益）： "
+                       + " ｜ ".join(f"+{h}周 {v:+.4f}" for h, v in sorted(rolling.items())))
 
         st.markdown("##### 各组合指标")
         st.dataframe(
             metrics.rename(columns={
                 "total_ret": "累计收益", "cagr": "年化", "ann_vol": "年化波动",
                 "sharpe": "Sharpe", "max_dd": "最大回撤", "win_rate": "周胜率",
+                "ir": "信息比率IR",
             }).round(4),
             width="stretch",
         )

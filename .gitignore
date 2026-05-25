@@ -27,6 +27,14 @@ logs/*.csv
 # Virtual env
 .venv/
 
+# 外部参考系统（各自带 .git，体量大，勿提交进 tech100）
+backtesting/
+qlib/
+
+# 策略层可再生产物（保留 config/universe_status.csv 与 data/paper/）
+data/backtest/
+data/signals/
+
 # OS
 .DS_Store
 Thumbs.db

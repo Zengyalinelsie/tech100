@@ -50,7 +50,8 @@ def main():
 
     print("\n=== 指标 ===")
     print(res["metrics"].round(3).to_string())
-    print("\n=== IC ===", {k: round(v, 4) for k, v in res["ic_summary"].items()})
+    print("\n=== IC / 换手 ===", {k: (round(v, 4) if isinstance(v, float) else v)
+                                  for k, v in res["ic_summary"].items()})
     print("\n=== NAV 末值 ===")
     print(res["nav"].iloc[-1].round(3).to_string())
 
