@@ -504,3 +504,44 @@ Claude 拿到结果后（同一天）：
 ---
 
 *版本：v2.0 ｜ 最后更新：2026-05-22 ｜ 上一版：v1.0（基于固定 FY 的错误设计，已废弃）*
+
+---
+
+## 十三、估值因子扩展（v2.2，2026-05-25，V7 选股看板）
+
+> 为「多因子加权选股看板」补齐分析师估值表所需的估值因子。已逐列核对其 `Index Future` / `quarterly earnings` 两张估值表，单股因子清单见 plan。
+
+### 13.1 panel sheet 新增 S–X 列（已写入 `templates/template_panel.xlsx`，公式待 Wind 个人版验证）
+
+| 列 | DB 字段 | 中文 | 公式（第3行，已填至 102 行） | 方向 |
+|---|---|---|---|---|
+| S | `pb` | 市净率 PB | `=[1]!s_val_pb($A3,$B3)` | 低=便宜 |
+| T | `roe_fwd` | 预期 ROE | `=[1]!s_west_avgroe($A3,YEAR($B3),$B3,180)` | 高=好 |
+| U | `div_yield` | 股息率 % | `=[1]!s_val_dividendyield2($A3,$B3)` | 高=好 |
+| V | `ev_ebitda` | EV/EBITDA | `=[1]!s_val_ev2_to_ebitda($A3,$B3)` | 低=便宜 |
+| W | `nde` | 净负债率 ND/E | `=[1]!s_fa_debttoequity($A3,$B3)` | 低=稳健 |
+| X | `profit_alert` | 盈警 Profit Alert | `=[1]!s_west_profitnotice($A3,$B3)` | 负面=看空 |
+
+- **Beta 不在此采**：后端 `factors.py` 用「个股收益 vs 恒生科技」滚动 52 周自算（`beta` 因子）。
+- EPS增长 / 远期PE / 远期E/P：用已有 fy1/fy2_eps 派生，无需新采。
+- DB schema：`scripts/migrate_add_valuation.py` 已用 `ALTER TABLE ADD COLUMN` 给 `panel_data` 加上述 6 列（非破坏、幂等）。
+- 采集脚本：`collect_panel.py` 的 `PANEL_RANGE` 已 `A3:R102`→`A3:X102`、`FIELDS` 已 +6、切片 `r[2:24]`。
+
+### 13.2 验证清单（用户在 Wind 个人版先测，再回拉）
+
+`B1`=`0700.HK`，`A1`=`=TODAY()`、`A2`=`2024-01-15`、`A3`=`2021-01-04`，在空白处测：
+
+| # | 字段 | 测试公式 | 期望 | 拿不到的备选/降级 |
+|---|---|---|---|---|
+| 1 | PB | `=[1]!s_val_pb($B$1,$A$1)` | 1–10 | 备 `s_val_pb_lf`；再不行用 1/(PE×派息率) 近似 |
+| 2 | ROE | `=[1]!s_west_avgroe($B$1,YEAR($A$1),$A$1,180)` | 5–30% | 备 `s_val_roe`/`s_fa_roe`（滚动实际） |
+| 3 | 股息率 | `=[1]!s_val_dividendyield2($B$1,$A$1)` | 0–8% | 备 `s_val_dividendyield` |
+| 4 | EV/EBITDA | `=[1]!s_val_ev2_to_ebitda($B$1,$A$1)` | 5–40 | 备 `s_val_evtoebitda`；再不行跳过 |
+| 5 | 净负债率 | `=[1]!s_fa_debttoequity($B$1,$A$1)` | 数值/可能 #NAME? | **风险高**，拿不到就跳过(不影响其余) |
+| 6 | 盈警 | `=[1]!s_west_profitnotice($B$1,$A$1)` | 文本/数值/可能 #NAME? | **风险高**，拿不到就跳过 |
+
+> #1–4 是核心估值因子,务必拿到;#5–6 风险高,拿不到不阻塞。每个公式 4 种结果同 §10（✅数字 / 0 / #N/A / 无授权）。
+>
+> 验证 OK 后回拉:`uv run python scripts/collect_panel.py --backfill --from 2021-01-04`（新列;耗时与现状相当）。回拉完，新估值因子自动出现在看板「🧮 多因子选股」权重面板。
+
+*v2.2 ｜ 2026-05-25 ｜ 估值因子扩展(PB/ROE/股息率/EV-EBITDA/净负债率/盈警 + Beta 自算)*

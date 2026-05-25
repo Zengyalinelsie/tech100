@@ -54,8 +54,19 @@ FACTORS = {
     "reversal_1w":         F("短期反转", "上周收益取负，买上周输家（短期反转）", False),
     "low_vol_12w":         F("低波动", "过去12周收益波动取负，越稳越看多", False),
     "ep":                  F("盈利收益率", "1/滚动PE，越便宜越高", False),
+    "beta":               F("低Beta", "过去52周对恒生科技的Beta取负，越低越看多", False),
     # 背离
     "exp_price_divergence": F("预期-价格背离", "预期在升但股价还没跟上（修正动量z − 价格动量z）", True),
+    # 增长（用一致预期派生）
+    "fwd_ep":             F("远期盈利收益率", "FY1每股盈利÷股价（远期PE的倒数，越便宜越高）", True),
+    "eps_growth":         F("预期EPS增速", "FY2/FY1 每股盈利−1，一致预期隐含的明年增速", True),
+    # 估值（需新采 Wind 字段，回拉前自动留空、不影响其他因子）
+    "bp":                 F("账面收益率", "1/市净率PB，越便宜越高（需采PB）", False),
+    "roe_fwd":            F("预期ROE", "一致预期净资产收益率，越高越好（需采ROE）", True),
+    "div_yield":          F("股息率", "每股股息÷股价，越高越好（需采股息率）", False),
+    "ebitda_yield":       F("EV/EBITDA倒数", "1/(EV/EBITDA)，企业价值口径越便宜越高（需采EV/EBITDA）", False),
+    "low_leverage":       F("低杠杆", "净负债率取负，越稳健越看多（需采净负债率）", False),
+    "profit_alert":       F("盈警", "港股业绩预告，负面预警看空（需采盈警）", False),
 }
 
 
@@ -84,6 +95,10 @@ def load_panel(conn=None) -> pd.DataFrame:
         conn.close()
     df["trade_date"] = pd.to_datetime(df["trade_date"])
     bench["trade_date"] = pd.to_datetime(bench["trade_date"])
+    # 新采估值原始列：未回拉时为 NULL，读出是 object/None → 强制转 numeric（全空→NaN）
+    for col in ["pb", "roe_fwd", "div_yield", "ev_ebitda", "nde", "profit_alert"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
     # close=0 视为缺失（次新股上市前 / 停牌）
     df.loc[df["close_hkd"] <= 0, "close_hkd"] = np.nan
     df.loc[df["mkt_cap"] <= 0, "mkt_cap"] = np.nan
@@ -97,6 +112,7 @@ def build_factor_panel(conn=None) -> pd.DataFrame:
     bench = bench.sort_values("trade_date")
     bench["mkt_ret"] = bench["hstech_close"].pct_change()
     mkt = bench[["trade_date", "mkt_ret"]]
+    df = df.merge(mkt, on="trade_date", how="left")    # 提前并入，供 beta 计算
 
     out = []
     for code, g in df.groupby("wind_code"):
@@ -142,6 +158,28 @@ def build_factor_panel(conn=None) -> pd.DataFrame:
         g["reversal_1w"] = -g["ret"]
         g["low_vol_12w"] = -g["ret"].rolling(12, min_periods=6).std()
         g["ep"] = 1.0 / g["pe_ttm"].where(g["pe_ttm"] > 0)
+        # 低Beta：过去52周对恒生科技的 Beta，取负（低beta=看多）
+        cov = g["ret"].rolling(52, min_periods=26).cov(g["mkt_ret"])
+        var = g["mkt_ret"].rolling(52, min_periods=26).var()
+        g["beta"] = -(cov / var.where(var > 1e-12))
+
+        # ---- 增长 / 远期估值（用一致预期派生） ----
+        g["fwd_ep"] = g["fy1_eps"] / g["close_hkd"]
+        g["eps_growth"] = g["fy2_eps"] / g["fy1_eps"].where(g["fy1_eps"] > 0) - 1
+
+        # ---- 估值因子（需新采 Wind 原始列；缺列时跳过，回拉后自动点亮） ----
+        if "pb" in g.columns:
+            g["bp"] = 1.0 / g["pb"].where(g["pb"] > 0)
+        if "roe_fwd" in g.columns:
+            g["roe_fwd"] = g["roe_fwd"]
+        if "div_yield" in g.columns:
+            g["div_yield"] = g["div_yield"]
+        if "ev_ebitda" in g.columns:
+            g["ebitda_yield"] = 1.0 / g["ev_ebitda"].where(g["ev_ebitda"] > 0)
+        if "nde" in g.columns:
+            g["low_leverage"] = -g["nde"]
+        if "profit_alert" in g.columns:
+            g["profit_alert"] = g["profit_alert"]
 
         # 价格动量(4周)中间量，供背离因子
         g["_mom_4w"] = g["close_hkd"] / g["close_hkd"].shift(4) - 1
@@ -150,8 +188,7 @@ def build_factor_panel(conn=None) -> pd.DataFrame:
 
     fac = pd.concat(out, ignore_index=True)
 
-    # 超额收益 = 个股收益 − 市场收益
-    fac = fac.merge(mkt, on="trade_date", how="left")
+    # 超额收益 = 个股收益 − 市场收益（mkt_ret 已在 df 阶段并入）
     fac["exret"] = fac["ret"] - fac["mkt_ret"]
 
     # ---- 预期-价格背离（截面 z 分：修正动量 − 价格动量） ----

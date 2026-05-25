@@ -24,7 +24,7 @@ import streamlit as st
 
 from factors import build_factor_panel, attach_industry, FACTORS
 from analysis_v2 import cross_correlation, bidir_regression_nw, event_study, granger_var
-from strategy import backtest, latest_signal
+from strategy import backtest, latest_signal, add_composite, screen_table
 from theme import PALETTE, PLOTLY_LAYOUT, bar_color, CUSTOM_CSS
 
 ROOT = Path(__file__).parent.parent.resolve()
@@ -69,6 +69,21 @@ def run_backtest(fac_json: str, x_col: str, hold: int, top_pct: float, cost_bps:
                    cost_bps=cost_bps, n_drop=n_drop)
     sig = latest_signal(fac, x_col=x_col, top_pct=top_pct)
     return res, sig
+
+
+@st.cache_data(ttl=3600, show_spinner="跑多因子选股…")
+def run_composite(fac_json: str, weights_items: tuple, hold: int, top_pct: float,
+                  cost_bps: float, n_drop: int):
+    fac = pd.read_json(StringIO(fac_json), orient="split")
+    fac["trade_date"] = pd.to_datetime(fac["trade_date"])
+    weights = dict(weights_items)
+    table = screen_table(fac, weights)
+    fac_c, used = add_composite(fac, weights)
+    if not used:
+        return table, None, []
+    res = backtest(fac_c, x_col="composite", hold_weeks=hold, top_pct=top_pct,
+                   cost_bps=cost_bps, n_drop=n_drop)
+    return table, res, used
 
 
 # ============== 加载 ==============
@@ -187,8 +202,9 @@ st.divider()
 
 
 # ============== Tab 路由 ==============
-tab_market, tab_stock, tab_rank, tab_strat = st.tabs([
+tab_market, tab_stock, tab_rank, tab_strat, tab_screen, tab_ref = st.tabs([
     "📊 市场整体", "🔍 个股深度", "🏆 100 家排行榜", "📈 策略回测",
+    "🧮 多因子选股", "📑 参考估值表",
 ])
 
 
@@ -544,3 +560,128 @@ with tab_strat:
             sell.insert(0, "序号", range(1, len(sell) + 1))
             sell = sell.rename(columns={"name": "名称", "wind_code": "代码", "ref_close_hkd": "参考价"})
             st.dataframe(sell, width="stretch", hide_index=True, column_config=ref_cfg)
+
+
+# ============================================================
+# Tab 5: 多因子选股
+# ============================================================
+with tab_screen:
+    st.subheader("多因子加权选股")
+    st.caption("给每个因子设权重 → 每只股票各因子按周标准化后加权合成总分 → 按总分排序选股。"
+               "权重为 0 的因子不参与；未采集的估值因子(如 PB/ROE)回拉后会自动出现。")
+
+    # 候选因子（仅展示当前有数据的）
+    menu = [("估值", ["ep", "fwd_ep", "bp", "ebitda_yield", "div_yield"]),
+            ("质量", ["roe_fwd", "low_leverage"]),
+            ("成长", ["eps_growth"]),
+            ("预期", ["ntm_rev_norm", "fy1_rev_norm", "rev_norm_4w"]),
+            ("价量/风险", ["mom_12w", "low_vol_12w", "beta"])]
+    default_w = {"ep": 1.0, "low_vol_12w": 1.0, "ntm_rev_norm": 1.0}
+
+    weights = {}
+    for grp, keys in menu:
+        keys = [k for k in keys if k in fac.columns and fac[k].notna().any()]
+        if not keys:
+            continue
+        st.markdown(f"**{grp}**")
+        cols_ui = st.columns(len(keys))
+        for col_ui, k in zip(cols_ui, keys):
+            weights[k] = col_ui.number_input(
+                FACTORS[k].name, min_value=0.0, max_value=5.0,
+                value=float(default_w.get(k, 0.0)), step=0.5,
+                key=f"w_{k}", help=FACTORS[k].desc)
+
+    sc1, sc2 = st.columns(2)
+    top_pct = sc1.slider("买入比例(占池)", 0.05, 0.40, 0.20, step=0.05, key="comp_top")
+    n_drop = sc2.slider("每期最多调仓只数", 1, max(1, int(round(top_pct * 100))),
+                        3, key="comp_ndrop")
+
+    active = {k: v for k, v in weights.items() if v}
+    if not active:
+        st.info("请至少给一个因子设置权重(>0)。")
+    else:
+        table, res_c, used = run_composite(
+            fac_json, tuple(sorted(active.items())), 1, top_pct, 30.0, n_drop)
+
+        st.markdown("##### 今日选股表(按总分排序)")
+        n_buy = max(1, int(round(top_pct * 100)))
+        if table is None or table.empty:
+            st.warning("无有效数据")
+        else:
+            st.caption(f"绿色 = 今日买入(总分前 {n_buy} 名)。")
+            st.download_button("📥 下载选股表 (CSV)",
+                               table.to_csv(index=False).encode("utf-8-sig"),
+                               file_name=f"screen_{latest}.csv", mime="text/csv")
+            st.dataframe(table, width="stretch", hide_index=True, height=480)
+
+        if res_c is not None and not res_c["nav"].empty:
+            st.divider()
+            st.markdown("##### 该权重组合的历史回测")
+            navc, mc, icc = res_c["nav"], res_c["metrics"], res_c["ic_summary"]
+            line_color = {"多头": PALETTE["up"], "空头": PALETTE["down"],
+                          "多空": PALETTE["forecast"], "恒生科技": PALETTE["neutral"]}
+            dash = {"多头": None, "空头": None, "多空": None, "恒生科技": "dash"}
+            figc = go.Figure()
+            for c in ["多头", "空头", "多空", "恒生科技"]:
+                figc.add_trace(go.Scatter(x=navc.index, y=navc[c], name=c, mode="lines",
+                                          line=dict(color=line_color[c], width=2.5, dash=dash[c])))
+            figc.add_hline(y=1.0, line_color="#BBB", line_width=1)
+            figc.update_layout(title=dict(text="组合净值曲线(起点=1.0)", x=0.5,
+                               font=dict(color=PALETTE["title"], size=15)),
+                               xaxis_title="日期", yaxis_title="净值", height=420,
+                               hovermode="x unified", **PLOTLY_LAYOUT)
+            st.plotly_chart(figc, width="stretch")
+            lng = mc.loc["多头"]; ls = mc.loc["多空"]
+            q1, q2, q3, q4 = st.columns(4)
+            q1.metric("多头累计", f"{lng['total_ret']*100:+.1f}%", f"IR {lng['ir']:+.2f}")
+            q2.metric("多空累计", f"{ls['total_ret']*100:+.1f}%")
+            q3.metric("多空 Sharpe", f"{ls['sharpe']:+.2f}")
+            q4.metric("IC 均值", f"{icc.get('ic_mean', float('nan')):+.4f}",
+                      f"ICIR {icc.get('ic_ir', float('nan')):+.2f}")
+            if not (icc.get("ic_mean", 0) > 0.02):
+                st.caption("注：横截面 IC 接近 0 时,多空 alpha 未稳定;多头相对基准 IR 仍可参考。结果仅供研究。")
+
+
+# ============================================================
+# Tab 6: 参考估值表(分析师原始估值表,静态)
+# ============================================================
+SYSTEM_DIR = ROOT / "system"
+
+
+@st.cache_data(ttl=3600, show_spinner="加载参考估值表…")
+def list_ref_files():
+    return sorted(p.name for p in SYSTEM_DIR.glob("*.xlsx")
+                  if "Equity research" not in p.name and not p.name.startswith("~"))
+
+
+@st.cache_data(ttl=3600, show_spinner="读取 sheet…")
+def load_ref_sheet(fname: str, sheet: str):
+    df = pd.read_excel(SYSTEM_DIR / fname, sheet_name=sheet, header=None)
+    df = df.dropna(axis=0, how="all").dropna(axis=1, how="all")
+    return df.astype(str).replace({"nan": "", "None": ""})
+
+
+@st.cache_data(ttl=3600)
+def ref_sheet_names(fname: str):
+    import openpyxl
+    wb = openpyxl.load_workbook(SYSTEM_DIR / fname, read_only=True)
+    names = wb.sheetnames
+    wb.close()
+    return names
+
+
+with tab_ref:
+    st.subheader("参考估值表(分析师原始表)")
+    st.warning("⚠️ 这是分析师提供的**静态快照**(部分数据截至 2021 年),非每日更新,仅供版式与口径参考。"
+               "「🧮 多因子选股」页是用我们的 live 数据按同一思路复刻的活表。")
+    files = list_ref_files()
+    if not files:
+        st.info("system/ 目录下未找到估值表文件。")
+    else:
+        f = st.selectbox("文件", files, key="ref_file")
+        sheets = ref_sheet_names(f)
+        sh = st.selectbox("Sheet", sheets, key="ref_sheet")
+        try:
+            st.dataframe(load_ref_sheet(f, sh), width="stretch", height=560)
+        except Exception as e:
+            st.error(f"读取失败：{e}")

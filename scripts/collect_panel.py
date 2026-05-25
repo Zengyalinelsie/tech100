@@ -33,8 +33,8 @@ LOG_DIR = ROOT / "logs"
 N_STOCKS = 100
 PANEL_FIRST_ROW = 3
 PANEL_LAST_ROW = PANEL_FIRST_ROW + N_STOCKS - 1      # 102
-PANEL_RANGE = f"A{PANEL_FIRST_ROW}:R{PANEL_LAST_ROW}"  # 代码+日期+16字段
-SENTINEL_CELL = f"R{PANEL_LAST_ROW}"                  # 最后一只市值
+PANEL_RANGE = f"A{PANEL_FIRST_ROW}:X{PANEL_LAST_ROW}"  # 代码+日期+22字段(16旧+6估值)
+SENTINEL_CELL = f"X{PANEL_LAST_ROW}"                  # 最后一只盈警
 
 MIN_WAIT = 3.0       # 写入后最小等待（让 Wind 启动 fetch，单元格变 "Fetch..."）
 POLL = 1.0           # 轮询间隔
@@ -116,11 +116,12 @@ def wait_calc(panel_sht) -> bool:
     return False
 
 
-# panel A3:R102 列序 → panel_data 字段（去掉 A 代码、B 日期后的 16 个）
+# panel A3:X102 列序 → panel_data 字段（去掉 A 代码、B 日期后的 22 个）
 FIELDS = [
     "fy1_np_avg", "fy1_eps", "fy1_instnum", "fy1_np_std", "fy1_np_median",
     "fy2_np_avg", "fy2_eps", "fy2_instnum", "fy2_np_std", "fy2_np_median",
     "close_hkd", "volume", "amount", "turn", "pe_ttm", "mkt_cap",
+    "pb", "roe_fwd", "div_yield", "ev_ebitda", "nde", "profit_alert",   # S–X 估值因子
 ]
 
 
@@ -139,12 +140,12 @@ def save_panel(conn, update_date, trade_date, grid):
         code = r[0]
         if not code or not isinstance(code, str):
             continue
-        vals = [_num(x) for x in r[2:18]]   # C..R = 16 字段
+        vals = [_num(x) for x in r[2:24]]   # C..X = 22 字段
         rows.append((update_date, trade_date, code.strip(), *vals))
     conn.executemany(
         f"""INSERT OR REPLACE INTO panel_data
             (update_date, trade_date, wind_code, {','.join(FIELDS)})
-            VALUES (?,?,?,{','.join(['?']*16)})""",
+            VALUES (?,?,?,{','.join(['?']*len(FIELDS))})""",
         rows,
     )
     return len(rows)

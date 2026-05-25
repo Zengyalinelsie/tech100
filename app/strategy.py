@@ -25,7 +25,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from factors import build_factor_panel, attach_industry, FACTORS
+from factors import build_factor_panel, attach_industry, FACTORS, _zscore
 
 WEEKS_PER_YEAR = 52
 UNIVERSE_STATUS = Path(__file__).parent.parent / "config" / "universe_status.csv"
@@ -317,6 +317,60 @@ def latest_signal(fac: pd.DataFrame | None = None, x_col: str = "fy1_rev_norm",
                                       "target_weight", "signal", "ref_close_hkd"])
 
 
+def add_composite(fac: pd.DataFrame, weights: dict):
+    """按权重把多个因子合成 composite 列：逐周截面 z 分 → 加权平均（按行非空因子）。
+
+    weights: {因子列名: 权重}。只用权重≠0 且存在于 fac 的因子；缺失因子(未采)自动忽略。
+    返回 (fac_with_composite, used_cols)。composite 已是"高=看多"，可直接喂 backtest。
+    """
+    fac = fac.copy()
+    cols = [c for c, w in weights.items() if w and c in fac.columns and fac[c].notna().any()]
+    if not cols:
+        fac["composite"] = np.nan
+        return fac, []
+    zmat = np.column_stack([
+        fac.groupby("trade_date")[c].transform(_zscore).to_numpy(dtype=float) for c in cols
+    ])
+    w = np.array([float(weights[c]) for c in cols])
+    present = ~np.isnan(zmat)
+    den = (present * np.abs(w)).sum(axis=1)
+    num = np.nansum(zmat * w, axis=1)
+    comp = np.full(len(den), np.nan)
+    m = den > 0
+    comp[m] = num[m] / den[m]
+    fac["composite"] = comp
+    return fac, cols
+
+
+def screen_table(fac: pd.DataFrame, weights: dict, date=None) -> pd.DataFrame:
+    """分析师风格选股表：某日按 composite 排序，含 PE/远期PE/预期增速/各因子值/总分。"""
+    if "name" not in fac.columns:
+        fac = attach_industry(fac)
+    fac, cols = add_composite(fac, weights)
+    fac = _prepare(fac)
+    fac["trade_date"] = pd.to_datetime(fac["trade_date"])
+    if date is None:
+        date = fac["trade_date"].max()
+    date = pd.Timestamp(date)
+
+    cs = fac[(fac["trade_date"] == date) & fac["eligible_base"] & fac["composite"].notna()].copy()
+    if cs.empty:
+        return pd.DataFrame()
+    cs = cs.sort_values("composite", ascending=False).reset_index(drop=True)
+    cs["排名"] = cs.index + 1
+    cs["远期PE"] = cs["close_hkd"] / cs["fy1_eps"].where(cs["fy1_eps"] > 0)
+
+    base = {"排名": cs["排名"], "名称": cs["name"], "代码": cs["wind_code"],
+            "行业": cs.get("industry_l1"), "股价": cs["close_hkd"].round(2),
+            "PE": cs["pe_ttm"].round(1), "远期PE": cs["远期PE"].round(1),
+            "预期增速%": (cs["eps_growth"] * 100).round(1)}
+    out = pd.DataFrame(base)
+    for c in cols:                                   # 各入选因子的原始值
+        out[FACTORS[c].name] = cs[c].round(4).values
+    out["总分"] = cs["composite"].round(3).values
+    return out
+
+
 if __name__ == "__main__":
     res = backtest(x_col="fy1_rev_norm", hold_weeks=1, n_drop=3)
     print("=== 指标 ===")
@@ -327,3 +381,11 @@ if __name__ == "__main__":
     print(res["nav"].iloc[-1].round(3).to_string())
     print("\n=== 本周选股(前6行) ===")
     print(latest_signal(x_col="fy1_rev_norm").head(6).to_string(index=False))
+
+    print("\n=== 多因子 composite 演示（E/P + 低波 + NTM 各 1 权重）===")
+    fac = build_factor_panel()
+    w = {"ep": 1, "low_vol_12w": 1, "ntm_rev_norm": 1}
+    rc = backtest(add_composite(fac, w)[0], x_col="composite", hold_weeks=1, n_drop=3)
+    print(rc["metrics"].round(3).to_string())
+    print("\n选股表(前6行):")
+    print(screen_table(fac, w).head(6).to_string(index=False))
