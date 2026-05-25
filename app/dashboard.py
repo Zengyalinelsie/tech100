@@ -24,6 +24,7 @@ import streamlit as st
 
 from factors import build_factor_panel, attach_industry
 from analysis_v2 import cross_correlation, bidir_regression_nw, event_study, granger_var
+from strategy import backtest, latest_signal
 from theme import PALETTE, PLOTLY_LAYOUT, bar_color, CUSTOM_CSS
 
 ROOT = Path(__file__).parent.parent.resolve()
@@ -58,6 +59,15 @@ def run_analysis(fac_json: str, x_col: str):
     gc = granger_var(fac, x_col=x_col, y_col="exret")
     return {"agg": agg, "raw": raw, "dirA": dirA, "dirB": dirB,
             "ev": ev, "n_up": n_up, "n_dn": n_dn, "gc": gc}
+
+
+@st.cache_data(ttl=3600, show_spinner="跑策略回测…")
+def run_backtest(fac_json: str, x_col: str, hold: int, top_pct: float, cost_bps: float):
+    fac = pd.read_json(StringIO(fac_json), orient="split")
+    fac["trade_date"] = pd.to_datetime(fac["trade_date"])
+    res = backtest(fac, x_col=x_col, hold_weeks=hold, top_pct=top_pct, cost_bps=cost_bps)
+    sig = latest_signal(fac, x_col=x_col, top_pct=top_pct)
+    return res, sig
 
 
 # ============== 加载 ==============
@@ -168,8 +178,8 @@ st.divider()
 
 
 # ============== Tab 路由 ==============
-tab_market, tab_stock, tab_rank = st.tabs([
-    "📊 市场整体", "🔍 个股深度", "🏆 100 家排行榜",
+tab_market, tab_stock, tab_rank, tab_strat = st.tabs([
+    "📊 市场整体", "🔍 个股深度", "🏆 100 家排行榜", "📈 策略回测",
 ])
 
 
@@ -379,3 +389,98 @@ with tab_rank:
                 "样本数": st.column_config.NumberColumn(format="%d"),
             },
         )
+
+
+# ============================================================
+# Tab 4: 策略回测
+# ============================================================
+with tab_strat:
+    st.subheader(f"多空组合回测 · 按 {fy_label} 预期修正选股")
+    st.caption(
+        "每周排序：信号最强 top% 买入（多头）、最弱 top% 卖出（空头）。"
+        "三条线 = 多头 / 空头簿损益 / 多空价差，基准 = 恒生科技。"
+        "**点位正确**：t 时点信号 → t+1 起结算，无前视。"
+    )
+
+    sc1, sc2, sc3 = st.columns(3)
+    hold = sc1.slider("持有/换仓周数", 1, 8, 1)
+    top_pct = sc2.slider("买卖各占池比例", 0.05, 0.40, 0.20, step=0.05)
+    cost_bps = sc3.slider("单边交易成本 (bps)", 0, 100, 30, step=5)
+
+    res, sig = run_backtest(fac_json, x_col, hold, top_pct, float(cost_bps))
+    nav, metrics, ic = res["nav"], res["metrics"], res["ic_summary"]
+
+    if nav.empty:
+        st.warning("数据不足，无法回测")
+    else:
+        line_color = {"多头": PALETTE["up"], "空头": PALETTE["down"],
+                      "多空": PALETTE["forecast"], "恒生科技": PALETTE["neutral"]}
+        dash = {"多头": None, "空头": None, "多空": None, "恒生科技": "dash"}
+        fig_nav = go.Figure()
+        for col in ["多头", "空头", "多空", "恒生科技"]:
+            fig_nav.add_trace(go.Scatter(
+                x=nav.index, y=nav[col], name=col, mode="lines",
+                line=dict(color=line_color[col], width=2.5, dash=dash[col]),
+            ))
+        fig_nav.add_hline(y=1.0, line_color="#BBB", line_width=1)
+        fig_nav.update_layout(
+            title=dict(text=f"组合净值曲线（起点=1.0，持有{hold}周）", x=0.5,
+                       font=dict(color=PALETTE["title"], size=15)),
+            xaxis_title="日期", yaxis_title="净值 (NAV)",
+            height=440, hovermode="x unified", **PLOTLY_LAYOUT,
+        )
+        st.plotly_chart(fig_nav, width="stretch")
+
+        ic_mean = ic.get("ic_mean", float("nan"))
+        ic_pos = ic.get("ic_pos_rate", float("nan"))
+        ls = metrics.loc["多空"]
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("多空累计收益", f"{ls['total_ret']*100:+.1f}%")
+        m2.metric("多空 Sharpe", f"{ls['sharpe']:+.2f}")
+        m3.metric("多空最大回撤", f"{ls['max_dd']*100:.1f}%")
+        m4.metric("IC 均值", f"{ic_mean:+.4f}", f"正率 {ic_pos*100:.0f}%")
+
+        if not (ic_mean > 0.02 and ls["sharpe"] > 0):
+            st.warning(
+                "⚠️ 当前信号在该参数下 **未显现可交易 alpha**（IC≈0 / Sharpe≤0）。"
+                "这与项目 CHARTER「可交易因子尚未就绪」一致 — 建议先加分歧度过滤、"
+                "用最优 lag、按行业切片再精炼，不要据此投入真金。"
+            )
+
+        st.markdown("##### 各组合指标")
+        st.dataframe(
+            metrics.rename(columns={
+                "total_ret": "累计收益", "cagr": "年化", "ann_vol": "年化波动",
+                "sharpe": "Sharpe", "max_dd": "最大回撤", "win_rate": "周胜率",
+            }).round(4),
+            width="stretch",
+        )
+
+    st.divider()
+    st.subheader(f"本周交易清单（{latest}）· 可下载对接 INF 回测系统")
+    st.caption("以最新收盘价为参考买卖价。LONG=买入 / SHORT=卖出。")
+    if sig.empty:
+        st.warning("本周无有效信号")
+    else:
+        sig_csv = sig.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "📥 下载本周信号 CSV（INF 可读）", sig_csv,
+            file_name=f"signal_{latest}.csv", mime="text/csv",
+        )
+        bcol, scol = st.columns(2)
+        with bcol:
+            st.markdown("**🟢 买入（多头）**")
+            st.dataframe(
+                sig[sig["side"] == "LONG"][["name", "wind_code", "signal", "ref_close_hkd"]]
+                .rename(columns={"name": "名称", "wind_code": "代码",
+                                 "signal": "信号", "ref_close_hkd": "参考价"}),
+                width="stretch", hide_index=True,
+            )
+        with scol:
+            st.markdown("**🔴 卖出（空头）**")
+            st.dataframe(
+                sig[sig["side"] == "SHORT"][["name", "wind_code", "signal", "ref_close_hkd"]]
+                .rename(columns={"name": "名称", "wind_code": "代码",
+                                 "signal": "信号", "ref_close_hkd": "参考价"}),
+                width="stretch", hide_index=True,
+            )

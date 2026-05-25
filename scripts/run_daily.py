@@ -81,6 +81,19 @@ def validate_data():
         return False
 
 
+def update_paper_portfolio():
+    """Step 2.5: 更新活体纸面组合（best-effort，失败不阻断主流程）"""
+    print("\n" + "=" * 60)
+    print("Step 2.5: 更新纸面组合 track record")
+    print("=" * 60)
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "run_paper.py")],
+        cwd=ROOT, capture_output=False,
+    )
+    if result.returncode != 0:
+        print("⚠️  纸面组合更新失败（不阻断流程）。")
+
+
 def push_to_github():
     """Step 3: 推送到 GitHub"""
     print("\n" + "=" * 60)
@@ -175,6 +188,9 @@ def main():
     if not validate_data():
         print("\n❌ 流程终止：数据校验不通过，未推送到远程。")
         sys.exit(1)
+
+    # Step 2.5: 更新纸面组合
+    update_paper_portfolio()
 
     # Step 3: 推送
     if not push_to_github():
