@@ -26,6 +26,7 @@ from factors import build_factor_panel, attach_industry, FACTORS
 from analysis_v2 import cross_correlation, bidir_regression_nw, event_study, granger_var
 from strategy import backtest, latest_signal, add_composite, screen_table
 from theme import PALETTE, PLOTLY_LAYOUT, bar_color, CUSTOM_CSS
+import verdicts
 
 ROOT = Path(__file__).parent.parent.resolve()
 DB_PATH = ROOT / "data" / "wind_history.db"
@@ -62,28 +63,72 @@ def run_analysis(fac_json: str, x_col: str):
 
 
 @st.cache_data(ttl=3600, show_spinner="跑策略回测…")
-def run_backtest(fac_json: str, x_col: str, hold: int, top_pct: float, cost_bps: float, n_drop: int):
+def run_backtest(fac_json: str, x_col: str, hold: int, top_pct: float, cost_bps: float,
+                 n_drop: int, n_trials: int = 1):
     fac = pd.read_json(StringIO(fac_json), orient="split")
     fac["trade_date"] = pd.to_datetime(fac["trade_date"])
     res = backtest(fac, x_col=x_col, hold_weeks=hold, top_pct=top_pct,
-                   cost_bps=cost_bps, n_drop=n_drop)
+                   cost_bps=cost_bps, n_drop=n_drop, n_trials=n_trials)
     sig = latest_signal(fac, x_col=x_col, top_pct=top_pct)
     return res, sig
 
 
 @st.cache_data(ttl=3600, show_spinner="跑多因子选股…")
 def run_composite(fac_json: str, weights_items: tuple, hold: int, top_pct: float,
-                  cost_bps: float, n_drop: int):
+                  cost_bps: float, n_drop: int, neutralize=None, date=None):
     fac = pd.read_json(StringIO(fac_json), orient="split")
     fac["trade_date"] = pd.to_datetime(fac["trade_date"])
     weights = dict(weights_items)
-    table = screen_table(fac, weights)
-    fac_c, used = add_composite(fac, weights)
+    table = screen_table(fac, weights, date=date, neutralize=neutralize)
+    fac_c, used = add_composite(fac, weights, neutralize=neutralize)
     if not used:
         return table, None, []
     res = backtest(fac_c, x_col="composite", hold_weeks=hold, top_pct=top_pct,
-                   cost_bps=cost_bps, n_drop=n_drop)
+                   cost_bps=cost_bps, n_drop=n_drop, n_trials=max(1, len(used)))
     return table, res, used
+
+
+def render_ic_stability(res, key: str):
+    """滚动 IC 曲线(逐日 IC + 8 周滚动均值)+ 分年 IC 柱,判断信号跨区间稳不稳。"""
+    icdf = res.get("ic")
+    summ = res.get("ic_summary", {}) or {}
+    if icdf is None or icdf.empty:
+        return
+    icdf = icdf.dropna(subset=["ic"]).copy()
+    if len(icdf) < 4:
+        return
+    icdf["date"] = pd.to_datetime(icdf["date"])
+    icdf = icdf.sort_values("date")
+    roll = icdf["ic"].rolling(8, min_periods=4).mean()
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=icdf["date"], y=icdf["ic"], name="周 IC", mode="lines",
+                             line=dict(color=PALETTE["down"], width=1)))
+    fig.add_trace(go.Scatter(x=icdf["date"], y=roll, name="8 周滚动均值", mode="lines",
+                             line=dict(color=PALETTE["forecast"], width=2.5)))
+    fig.add_hline(y=0, line_color="#BBB", line_width=1)
+    fig.update_layout(title=dict(text="滚动 IC 稳定性", x=0.5,
+                      font=dict(color=PALETTE["title"], size=14)),
+                      xaxis_title="日期", yaxis_title="IC", height=320,
+                      hovermode="x unified", **PLOTLY_LAYOUT)
+    st.plotly_chart(fig, width="stretch", key=f"ic_roll_{key}")
+
+    sub = summ.get("subperiod_ic", {}) or {}
+    by_year = sub.get("by_year", {})
+    if by_year:
+        yrs = sorted(by_year)
+        vals = [by_year[y] for y in yrs]
+        figy = go.Figure(go.Bar(x=[str(y) for y in yrs], y=vals, marker_color=bar_color(vals)))
+        figy.add_hline(y=0, line_color="#BBB", line_width=1)
+        figy.update_layout(title=dict(text="分年 IC（跨区间稳健性）", x=0.5,
+                           font=dict(color=PALETTE["title"], size=14)),
+                           xaxis_title="年", yaxis_title="年内平均 IC", height=300,
+                           **PLOTLY_LAYOUT)
+        st.plotly_chart(figy, width="stretch", key=f"ic_year_{key}")
+        io = sub.get("is_oos", {})
+        if io:
+            st.caption(f"样本内 IC {io.get('is', float('nan')):+.4f} ｜ "
+                       f"样本外 IC {io.get('oos', float('nan')):+.4f}"
+                       "（两者背离大说明信号可能过拟合）。")
 
 
 # ============== 加载 ==============
@@ -214,6 +259,7 @@ tab_market, tab_stock, tab_rank, tab_strat, tab_screen = st.tabs([
 with tab_market:
     st.subheader(f"{fy_label}与超额收益的交叉相关性")
     st.caption("k > 0：预期领先股价 ｜ k < 0：股价领先预期 ｜ k = 0：同步")
+    st.info(verdicts.verdict_market(best_lag, best_r, best_sig))
     if agg.empty:
         st.warning("数据不足")
     else:
@@ -354,6 +400,8 @@ with tab_stock:
             raw = result["raw"]
             sub_raw = raw[raw["wind_code"] == selected_code].sort_values("lag")
             if not sub_raw.empty:
+                _b = sub_raw.loc[sub_raw["r"].abs().idxmax()]
+                st.info(verdicts.verdict_stock(selected_name, int(_b["lag"]), float(_b["r"])))
                 st.markdown(f"##### 该股 {fy_label} vs 超额收益")
                 fig_c = go.Figure()
                 fig_c.add_trace(go.Bar(
@@ -401,6 +449,7 @@ with tab_rank:
         c3.metric("预期领先股票数", f"{n_lead_exp} 只", f"{n_lead_exp/len(best)*100:.0f}%")
         n_sig_stock = (best["显著"] == "★").sum()
         c4.metric("显著样本数", f"{n_sig_stock} 只", f"{n_sig_stock/len(best)*100:.0f}%")
+        st.info(verdicts.verdict_rank(int(n_lead_exp), int(n_lead_price), int(n_sig_stock), len(best)))
 
         csv = best.to_csv(index=False).encode("utf-8-sig")
         st.download_button("📥 下载 CSV", csv, file_name=f"ranking_{x_col}_{latest}.csv", mime="text/csv")
@@ -444,20 +493,23 @@ with tab_strat:
     n_drop = sc4.slider("每期最多调仓只数", 1, topk_est, min(3, topk_est),
                         help="每次调仓时最多替换的标的数量。数值越小换手越低、交易成本越省，组合更稳定。")
 
-    res, sig = run_backtest(fac_json, x_col, hold, top_pct, float(cost_bps), n_drop)
+    res, sig = run_backtest(fac_json, x_col, hold, top_pct, float(cost_bps), n_drop,
+                            n_trials=len(FACTORS))
     nav, metrics, ic = res["nav"], res["metrics"], res["ic_summary"]
 
     if nav.empty:
         st.warning("数据不足，无法回测")
     else:
-        line_color = {"多头": PALETTE["up"], "空头": PALETTE["down"],
-                      "多空": PALETTE["forecast"], "恒生科技": PALETTE["neutral"]}
-        dash = {"多头": None, "空头": None, "多空": None, "恒生科技": "dash"}
+        # long-only 为主:多头加粗主色;空头/多空淡化虚线(港股做空受限,仅供研究)
+        line_color = {"多头": PALETTE["price"], "空头": PALETTE["neutral"],
+                      "多空": PALETTE["neutral"], "恒生科技": PALETTE["neutral"]}
+        dash = {"多头": None, "空头": "dot", "多空": "dash", "恒生科技": "dash"}
+        width = {"多头": 3.2, "空头": 1.3, "多空": 1.6, "恒生科技": 1.6}
         fig_nav = go.Figure()
         for col in ["多头", "空头", "多空", "恒生科技"]:
             fig_nav.add_trace(go.Scatter(
                 x=nav.index, y=nav[col], name=col, mode="lines",
-                line=dict(color=line_color[col], width=2.5, dash=dash[col]),
+                line=dict(color=line_color[col], width=width[col], dash=dash[col]),
             ))
         fig_nav.add_hline(y=1.0, line_color="#BBB", line_width=1)
         fig_nav.update_layout(
@@ -467,22 +519,26 @@ with tab_strat:
             height=440, hovermode="x unified", **PLOTLY_LAYOUT,
         )
         st.plotly_chart(fig_nav, width="stretch")
+        st.caption("**多头**为可执行交付(主线);**空头/多空**近似市场中性、仅供研究"
+                   "——港股中小盘多无券可借或借券昂贵,空头腿难落地。")
 
         ic_mean = ic.get("ic_mean", float("nan"))
         ic_pos = ic.get("ic_pos_rate", float("nan"))
         ic_ir = ic.get("ic_ir", float("nan"))
         turn_l = ic.get("turnover_long", float("nan"))
+        dsr = ic.get("deflated_sharpe", float("nan"))
         ls = metrics.loc["多空"]
         lng = metrics.loc["多头"]
+        st.info(verdicts.verdict_backtest(ic_mean, ic_ir, dsr=dsr, long_ir=float(lng["ir"])))
         m1, m2, m3, m4, m5, m6 = st.columns(6)
         m1.metric("多头累计", f"{lng['total_ret']*100:+.1f}%", f"IR {lng['ir']:+.2f}",
                   help="多头组合的累计收益；IR（信息比率）= 相对恒生科技的超额收益 ÷ 跟踪误差，衡量稳定跑赢基准的能力。")
         m2.metric("多空累计", f"{ls['total_ret']*100:+.1f}%",
-                  help="多空价差组合（买入多头、卖出空头）的累计收益，剔除大盘涨跌、近似市场中性。")
+                  help="多空价差组合（买入多头、卖出空头）的累计收益，剔除大盘涨跌、近似市场中性。仅供研究。")
         m3.metric("多空 Sharpe", f"{ls['sharpe']:+.2f}",
                   help="风险调整后收益 = 年化收益 ÷ 年化波动，越高越好。")
-        m4.metric("最大回撤", f"{ls['max_dd']*100:.1f}%",
-                  help="多空组合从历史高点到低点的最大跌幅，衡量下行风险。")
+        m4.metric("Deflated Sharpe", f"{dsr:.2f}" if pd.notna(dsr) else "—",
+                  help=f"扣除多重检验偏差后真实 Sharpe>0 的概率（试验数 n={len(FACTORS)} 个因子）。>0.95 较稳健，越低越可能是过拟合。")
         m5.metric("IC 均值", f"{ic_mean:+.4f}", f"ICIR {ic_ir:+.2f}",
                   help="IC = 信号与未来收益的横截面秩相关，衡量选股预测力；ICIR = IC 均值 ÷ IC 波动（年化），衡量稳定性。")
         m6.metric("换手/期", f"{turn_l*100:.0f}%", f"胜率 {ic_pos*100:.0f}%",
@@ -499,6 +555,8 @@ with tab_strat:
         if rolling:
             st.caption("分层 IC（信号对未来 1/2/4 周收益的预测力）： "
                        + " ｜ ".join(f"未来 {h} 周 {v:+.4f}" for h, v in sorted(rolling.items())))
+
+        render_ic_stability(res, key="strat")
 
         with st.expander("指标说明"):
             st.markdown(
@@ -591,53 +649,67 @@ with tab_screen:
                 value=float(default_w.get(k, 0.0)), step=0.5,
                 key=f"w_{k}", help=FACTORS[k].desc)
 
-    sc1, sc2 = st.columns(2)
+    sc1, sc2, sc3 = st.columns(3)
     top_pct = sc1.slider("买入比例(占池)", 0.05, 0.40, 0.20, step=0.05, key="comp_top")
     n_drop = sc2.slider("每期最多调仓只数", 1, max(1, int(round(top_pct * 100))),
                         3, key="comp_ndrop")
+    neu_label = sc3.radio("中性化", ["无", "行业", "行业+市值"], horizontal=True, key="comp_neu",
+                          help="剔除净行业/市值暴露,逼出真 alpha。'无'=沿用原始截面 z 加权。")
+    neutralize = {"无": None, "行业": "industry", "行业+市值": "industry+size"}[neu_label]
+
+    _dates = sorted(fac["trade_date"].unique(), reverse=True)
+    _date_opts = [pd.Timestamp(d).strftime("%Y-%m-%d") for d in _dates]
+    as_of = st.selectbox("分析日期 (as-of)", _date_opts, index=0, key="comp_date",
+                         help="查看任一历史交易日按当前权重会选出什么(无前视)。")
 
     active = {k: v for k, v in weights.items() if v}
     if not active:
         st.info("请至少给一个因子设置权重(>0)。")
     else:
         table, res_c, used = run_composite(
-            fac_json, tuple(sorted(active.items())), 1, top_pct, 30.0, n_drop)
+            fac_json, tuple(sorted(active.items())), 1, top_pct, 30.0, n_drop,
+            neutralize=neutralize, date=as_of)
 
+        _top_name = table["名称"].iloc[0] if (table is not None and not table.empty) else None
+        st.info(verdicts.verdict_screen(_top_name, neutralize=neutralize, date=as_of))
         st.markdown("##### 今日选股表(按总分排序)")
         n_buy = max(1, int(round(top_pct * 100)))
         if table is None or table.empty:
             st.warning("无有效数据")
         else:
-            st.caption(f"绿色 = 今日买入(总分前 {n_buy} 名)。")
+            st.caption(f"绿色 = 当日买入(总分前 {n_buy} 名)。")
             st.download_button("📥 下载选股表 (CSV)",
                                table.to_csv(index=False).encode("utf-8-sig"),
-                               file_name=f"screen_{latest}.csv", mime="text/csv")
+                               file_name=f"screen_{as_of}.csv", mime="text/csv")
             st.dataframe(table, width="stretch", hide_index=True, height=480)
 
         if res_c is not None and not res_c["nav"].empty:
             st.divider()
             st.markdown("##### 该权重组合的历史回测")
             navc, mc, icc = res_c["nav"], res_c["metrics"], res_c["ic_summary"]
-            line_color = {"多头": PALETTE["up"], "空头": PALETTE["down"],
-                          "多空": PALETTE["forecast"], "恒生科技": PALETTE["neutral"]}
-            dash = {"多头": None, "空头": None, "多空": None, "恒生科技": "dash"}
+            line_color = {"多头": PALETTE["price"], "空头": PALETTE["neutral"],
+                          "多空": PALETTE["neutral"], "恒生科技": PALETTE["neutral"]}
+            dash = {"多头": None, "空头": "dot", "多空": "dash", "恒生科技": "dash"}
+            width = {"多头": 3.2, "空头": 1.3, "多空": 1.6, "恒生科技": 1.6}
             figc = go.Figure()
             for c in ["多头", "空头", "多空", "恒生科技"]:
                 figc.add_trace(go.Scatter(x=navc.index, y=navc[c], name=c, mode="lines",
-                                          line=dict(color=line_color[c], width=2.5, dash=dash[c])))
+                                          line=dict(color=line_color[c], width=width[c], dash=dash[c])))
             figc.add_hline(y=1.0, line_color="#BBB", line_width=1)
             figc.update_layout(title=dict(text="组合净值曲线(起点=1.0)", x=0.5,
                                font=dict(color=PALETTE["title"], size=15)),
                                xaxis_title="日期", yaxis_title="净值", height=420,
                                hovermode="x unified", **PLOTLY_LAYOUT)
             st.plotly_chart(figc, width="stretch")
+            st.caption("**多头**为可执行交付(主线);空头/多空仅供研究(港股做空受限)。")
             lng = mc.loc["多头"]; ls = mc.loc["多空"]
             q1, q2, q3, q4 = st.columns(4)
             q1.metric("多头累计", f"{lng['total_ret']*100:+.1f}%", f"IR {lng['ir']:+.2f}")
             q2.metric("多空累计", f"{ls['total_ret']*100:+.1f}%")
-            q3.metric("多空 Sharpe", f"{ls['sharpe']:+.2f}")
+            q3.metric("Deflated Sharpe", f"{icc.get('deflated_sharpe', float('nan')):.2f}")
             q4.metric("IC 均值", f"{icc.get('ic_mean', float('nan')):+.4f}",
                       f"ICIR {icc.get('ic_ir', float('nan')):+.2f}")
             if not (icc.get("ic_mean", 0) > 0.02):
                 st.caption("注：横截面 IC 接近 0 时,多空 alpha 未稳定;多头相对基准 IR 仍可参考。结果仅供研究。")
+            render_ic_stability(res_c, key="screen")
 

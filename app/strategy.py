@@ -24,6 +24,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from scipy.stats import norm
 
 from factors import build_factor_panel, attach_industry, FACTORS, _zscore
 
@@ -181,6 +182,48 @@ def _rolling_ic(fac: pd.DataFrame, x_col: str, horizons=(1, 2, 4)) -> dict:
     return {"by_h": by_h, "series1": series1}
 
 
+def subperiod_ic(series1: pd.Series) -> dict:
+    """把逐日 IC 序列按日历年分桶求均值,并做 70/30 时序样本内外二分。
+
+    返回 {"by_year": {2021: ic, ...}, "is_oos": {"is": ic, "oos": ic}}。判断信号
+    跨区间是否稳定 —— 单一区间表现好但分年/样本外塌掉,就是过拟合信号。
+    """
+    if series1 is None or len(series1) < 2:
+        return {"by_year": {}, "is_oos": {}}
+    s = series1.dropna().copy()
+    s.index = pd.to_datetime(s.index)
+    by_year = {int(y): float(g.mean()) for y, g in s.groupby(s.index.year)}
+    k = int(len(s) * 0.7)
+    is_oos = ({"is": float(s.iloc[:k].mean()), "oos": float(s.iloc[k:].mean())}
+              if 1 <= k < len(s) else {})
+    return {"by_year": by_year, "is_oos": is_oos}
+
+
+def deflated_sharpe(sharpe_annual: float, n_obs: int, n_trials: int,
+                    skew: float = 0.0, kurt: float = 3.0,
+                    periods_per_year: int = WEEKS_PER_YEAR) -> float:
+    """Deflated Sharpe Ratio(Bailey & López de Prado）。
+
+    把"试过 n_trials 个因子/配置"的多重检验偏差扣掉,返回真实 Sharpe>0 的概率 ∈[0,1]。
+    n_trials 越大、样本越短、偏度越负/尾部越厚 → DSR 越低。<0.95 应警惕过拟合。
+    """
+    if n_obs < 3 or not np.isfinite(sharpe_annual):
+        return float("nan")
+    sr = sharpe_annual / np.sqrt(periods_per_year)          # 每期 Sharpe
+    var_sr = (1.0 - skew * sr + (kurt - 1.0) / 4.0 * sr ** 2) / (n_obs - 1)
+    if var_sr <= 0:
+        return float("nan")
+    sd_sr = np.sqrt(var_sr)
+    N = max(1, int(n_trials))
+    emc = 0.5772156649015329                                 # Euler-Mascheroni
+    if N > 1:
+        sr0 = sd_sr * ((1 - emc) * norm.ppf(1 - 1.0 / N)
+                       + emc * norm.ppf(1 - 1.0 / (N * np.e)))
+    else:
+        sr0 = 0.0
+    return float(norm.cdf((sr - sr0) / sd_sr))
+
+
 def backtest(
     fac: pd.DataFrame | None = None,
     x_col: str = "fy1_rev_norm",
@@ -189,6 +232,7 @@ def backtest(
     cost_bps: float = 30.0,
     n_drop: int = 3,
     start: str | None = None,
+    n_trials: int = 1,
 ) -> dict:
     """非重叠 hold_weeks 周换仓的多空回测（带股池清洗 + n_drop 降换手）。"""
     if fac is None:
@@ -275,6 +319,7 @@ def backtest(
     ic_summary = {}
     if len(s1) > 1:
         std = s1.std(ddof=1)
+        ls_ret = wk["ls_ret"].dropna()
         ic_summary = {
             "ic_mean": float(s1.mean()),
             "ic_ir": float(s1.mean() / std * np.sqrt(WEEKS_PER_YEAR)) if std > 0 else np.nan,
@@ -282,6 +327,11 @@ def backtest(
             "rolling_ic": {int(h): v for h, v in ric["by_h"].items()},
             "turnover_long": float(np.mean(turns_l)) if turns_l else np.nan,
             "turnover_short": float(np.mean(turns_s)) if turns_s else np.nan,
+            "subperiod_ic": subperiod_ic(s1),
+            "deflated_sharpe": deflated_sharpe(
+                float(metrics.loc["多空", "sharpe"]), len(ls_ret), n_trials,
+                skew=float(ls_ret.skew()), kurt=float(ls_ret.kurtosis() + 3.0)),
+            "n_trials": int(n_trials),
         }
 
     return {
@@ -317,10 +367,57 @@ def latest_signal(fac: pd.DataFrame | None = None, x_col: str = "fy1_rev_norm",
                                       "target_weight", "signal", "ref_close_hkd"])
 
 
-def add_composite(fac: pd.DataFrame, weights: dict):
+def _parse_neutralize(neutralize) -> set:
+    """把 neutralize 参数归一成 {'industry','size'} 子集。接受 None / 'industry' /
+    'size' / 'industry+size' / 可迭代。无法识别的项忽略。"""
+    if not neutralize:
+        return set()
+    toks = neutralize.replace(",", "+").split("+") if isinstance(neutralize, str) else list(neutralize)
+    return {t.strip() for t in toks if t.strip() in ("industry", "size")}
+
+
+def _neutralize_cross_section(fac: pd.DataFrame, controls: set) -> pd.Series:
+    """逐交易日把 composite 对控制变量做 OLS,取残差再截面标准化(剔除净行业/市值暴露)。
+
+    controls ⊆ {'industry','size'}。行业用 industry_l1 哑变量,市值用 log(mkt_cap)。
+    缺控制变量或截面样本不足的行/截面原样保留,不参与回归。
+    """
+    use_ind = "industry" in controls and "industry_l1" in fac.columns and fac["industry_l1"].notna().any()
+    use_size = "size" in controls and "mkt_cap" in fac.columns
+    if not (use_ind or use_size):
+        return fac["composite"]
+
+    resid = fac["composite"].copy()
+    for _, sub in fac.groupby("trade_date"):
+        m = sub["composite"].notna()
+        if use_size:
+            m = m & sub["mkt_cap"].notna() & (sub["mkt_cap"] > 0)
+        if use_ind:
+            m = m & sub["industry_l1"].notna()
+        if m.sum() < 5:
+            continue
+        parts = [np.ones((int(m.sum()), 1))]
+        if use_size:
+            parts.append(np.log(sub.loc[m, "mkt_cap"].to_numpy(float)).reshape(-1, 1))
+        if use_ind:
+            dummies = pd.get_dummies(sub.loc[m, "industry_l1"], drop_first=True)
+            if dummies.shape[1]:
+                parts.append(dummies.to_numpy(float))
+        X = np.hstack(parts)
+        y = sub.loc[m, "composite"].to_numpy(float)
+        beta, *_ = np.linalg.lstsq(X, y, rcond=None)
+        resid.loc[sub.index[m]] = y - X @ beta
+
+    # 残差再做截面 z,使尺度与未中性化版本可比
+    return fac.assign(_resid=resid).groupby("trade_date")["_resid"].transform(_zscore)
+
+
+def add_composite(fac: pd.DataFrame, weights: dict, neutralize=None):
     """按权重把多个因子合成 composite 列：逐周截面 z 分 → 加权平均（按行非空因子）。
 
     weights: {因子列名: 权重}。只用权重≠0 且存在于 fac 的因子；缺失因子(未采)自动忽略。
+    neutralize: None(默认,不中性化) / 'industry' / 'size' / 'industry+size'。开启后对
+        合成总分逐截面做 OLS 残差化,剔除净行业/市值暴露,逼出真 alpha。
     返回 (fac_with_composite, used_cols)。composite 已是"高=看多"，可直接喂 backtest。
     """
     fac = fac.copy()
@@ -339,14 +436,18 @@ def add_composite(fac: pd.DataFrame, weights: dict):
     m = den > 0
     comp[m] = num[m] / den[m]
     fac["composite"] = comp
+
+    controls = _parse_neutralize(neutralize)
+    if controls:
+        fac["composite"] = _neutralize_cross_section(fac, controls)
     return fac, cols
 
 
-def screen_table(fac: pd.DataFrame, weights: dict, date=None) -> pd.DataFrame:
+def screen_table(fac: pd.DataFrame, weights: dict, date=None, neutralize=None) -> pd.DataFrame:
     """分析师风格选股表：某日按 composite 排序，含 PE/远期PE/预期增速/各因子值/总分。"""
     if "name" not in fac.columns:
         fac = attach_industry(fac)
-    fac, cols = add_composite(fac, weights)
+    fac, cols = add_composite(fac, weights, neutralize=neutralize)
     fac = _prepare(fac)
     fac["trade_date"] = pd.to_datetime(fac["trade_date"])
     if date is None:
