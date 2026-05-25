@@ -25,7 +25,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from factors import build_factor_panel, attach_industry
+from factors import build_factor_panel, attach_industry, FACTORS
 
 WEEKS_PER_YEAR = 52
 UNIVERSE_STATUS = Path(__file__).parent.parent / "config" / "universe_status.csv"
@@ -59,15 +59,13 @@ def _prepare(fac: pd.DataFrame, liq_pct: float = LIQ_PCT) -> pd.DataFrame:
 
 
 def _eligible(fac: pd.DataFrame, x_col: str) -> pd.DataFrame:
-    """可交易 + 流动 + 未退市 + 信号/市值/机构覆盖齐全。"""
+    """可交易 + 流动 + 未退市 + 信号/市值齐全；预期类因子额外要求有分析师覆盖。"""
     fac = _prepare(fac)
-    inst_col = "fy1_instnum" if x_col.startswith("fy1") else "fy2_instnum"
-    m = (
-        fac["eligible_base"]
-        & fac[x_col].notna()
-        & fac["mkt_cap"].notna()
-        & (fac[inst_col].fillna(0) > 0)
-    )
+    m = fac["eligible_base"] & fac[x_col].notna() & fac["mkt_cap"].notna()
+    meta = FACTORS.get(x_col)
+    if meta is not None and meta.needs_coverage:
+        inst_col = "fy2_instnum" if x_col.startswith("fy2") else "fy1_instnum"
+        m = m & (fac[inst_col].fillna(0) > 0)
     return fac[m]
 
 

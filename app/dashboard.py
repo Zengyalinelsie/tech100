@@ -22,7 +22,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
-from factors import build_factor_panel, attach_industry
+from factors import build_factor_panel, attach_industry, FACTORS
 from analysis_v2 import cross_correlation, bidir_regression_nw, event_study, granger_var
 from strategy import backtest, latest_signal
 from theme import PALETTE, PLOTLY_LAYOUT, bar_color, CUSTOM_CSS
@@ -86,14 +86,20 @@ st.sidebar.caption(f"📅 数据最新至：{latest}")
 st.sidebar.caption(f"📊 5.4 年周频 / 100 股 / FY1+FY2 双预期")
 
 # FY1 / FY2 切换
-fy_choice = st.sidebar.radio(
-    "**预期口径**",
-    ["FY1（当年预期）", "FY2（下一年预期）"],
-    index=1,
-    help="选择驱动全站分析的盈利预期口径。FY2 = 下一年盈利预期，对新信息更敏感；FY1 = 当年预期，年内会随业绩兑现机械收敛。",
+# 因子选择
+_factor_names = [m.name for m in FACTORS.values()]
+_name2col = {m.name: col for col, m in FACTORS.items()}
+_default = "FY1 预期修正" if "FY1 预期修正" in _factor_names else _factor_names[0]
+fy_choice = st.sidebar.selectbox(
+    "**信号因子**",
+    _factor_names,
+    index=_factor_names.index(_default),
+    help="选择驱动全站分析与回测的选股信号。不同因子的「最强/最弱」含义不同，见下方说明。",
 )
-x_col = "fy1_rev_norm" if "FY1" in fy_choice else "fy2_rev_norm"
-fy_label = "FY1" if "FY1" in fy_choice else "FY2"
+x_col = _name2col[fy_choice]
+fy_label = FACTORS[x_col].name
+sig_desc = FACTORS[x_col].desc
+st.sidebar.caption(f"📖 {sig_desc}")
 
 st.sidebar.markdown("---")
 
@@ -138,7 +144,7 @@ result = run_analysis(fac_json, x_col)
 # ============== 主标题 + KPI ==============
 st.title("香港科技 100 · 盈利预期与股价联动看板")
 st.caption(
-    f"分析变量：**{fy_label} 预期修正**（市值标准化）vs **超额收益**（相对恒生科技指数）"
+    f"分析变量：**{fy_label}** vs **超额收益**（相对恒生科技指数）"
     f" | 行业范围：{sel_industry}"
 )
 
@@ -190,7 +196,7 @@ tab_market, tab_stock, tab_rank, tab_strat = st.tabs([
 # Tab 1: 市场整体
 # ============================================================
 with tab_market:
-    st.subheader(f"{fy_label} 预期修正与超额收益的交叉相关性")
+    st.subheader(f"{fy_label}与超额收益的交叉相关性")
     st.caption("k > 0：预期领先股价 ｜ k < 0：股价领先预期 ｜ k = 0：同步")
     if agg.empty:
         st.warning("数据不足")
@@ -237,7 +243,7 @@ with tab_market:
 
     st.divider()
     st.subheader("事件研究：预期大幅修正前后的累计超额收益")
-    st.caption(f"事件 = 截面 90%/10% 分位 {fy_label} 预期修正；累计 = sum 超额收益")
+    st.caption(f"事件 = 截面 90%/10% 分位 {fy_label}；累计 = sum 超额收益")
     ev = result["ev"]
     if not ev.empty:
         fig_ev = go.Figure()
@@ -268,7 +274,7 @@ with tab_market:
 
     st.divider()
     st.subheader("VAR 模型与 Granger 因果检验")
-    st.caption(f"对 {fy_label} 预期修正和超额收益的全市场截面平均序列做 VAR")
+    st.caption(f"对 {fy_label}和超额收益的全市场截面平均序列做 VAR")
     if gc and "error" not in gc:
         g1, g2 = st.columns(2)
         g1.metric(
@@ -332,7 +338,7 @@ with tab_stock:
             raw = result["raw"]
             sub_raw = raw[raw["wind_code"] == selected_code].sort_values("lag")
             if not sub_raw.empty:
-                st.markdown(f"##### 该股 {fy_label} 预期修正 vs 超额收益")
+                st.markdown(f"##### 该股 {fy_label} vs 超额收益")
                 fig_c = go.Figure()
                 fig_c.add_trace(go.Bar(
                     x=sub_raw["lag"], y=sub_raw["r"],
@@ -355,7 +361,7 @@ with tab_stock:
 # ============================================================
 with tab_rank:
     st.subheader("100 家公司领先-滞后排行")
-    st.caption(f"基于 {fy_label} 预期修正与超额收益。★ = 单股 |r| > 0.115（n≈260 时 5% 显著阈值）")
+    st.caption(f"基于 {fy_label}与超额收益。★ = 单股 |r| > 0.115（n≈260 时 5% 显著阈值）")
 
     raw = result["raw"]
     if raw.empty:
@@ -381,7 +387,7 @@ with tab_rank:
         c4.metric("显著样本数", f"{n_sig_stock} 只", f"{n_sig_stock/len(best)*100:.0f}%")
 
         csv = best.to_csv(index=False).encode("utf-8-sig")
-        st.download_button("📥 下载 CSV", csv, file_name=f"ranking_{fy_label}_{latest}.csv", mime="text/csv")
+        st.download_button("📥 下载 CSV", csv, file_name=f"ranking_{x_col}_{latest}.csv", mime="text/csv")
 
         sorted_best = best.assign(_abs=best["相关r"].abs()).sort_values(
             "_abs", ascending=False).drop(columns=["_abs"])
@@ -404,10 +410,11 @@ with tab_rank:
 # Tab 4: 策略回测
 # ============================================================
 with tab_strat:
-    st.subheader(f"多空组合回测 · 按 {fy_label} 预期修正选股")
+    st.subheader(f"多空组合回测 · 按「{fy_label}」选股")
     st.caption(
-        f"每周按 {fy_label} 预期修正排序：最强组买入（多头）、最弱组卖出（空头），已剔除停牌与低流动性标的。"
-        "净值曲线含三条组合（多头 / 空头 / 多空价差）与恒生科技基准；信号在当周确定、次周起结算，无未来信息。"
+        f"每周按 {fy_label} 排序：数值最高的一组买入（多头），最低的一组卖出（空头），已剔除停牌与低流动性标的。"
+        f"**「最强」= {fy_label} 数值最高的 20%，「最弱」= 最低的 20%**（{sig_desc}）。"
+        "净值含多头 / 空头 / 多空价差三条与恒生科技基准；信号当周确定、次周起结算，无未来信息。"
     )
 
     sc1, sc2, sc3, sc4 = st.columns(4)
