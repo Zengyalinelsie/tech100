@@ -24,6 +24,7 @@ from datetime import datetime, date, timedelta
 from pathlib import Path
 
 import xlwings as xw
+from tqdm import tqdm
 
 ROOT = Path(__file__).parent.parent.resolve()
 TEMPLATE = ROOT / "templates" / "template_panel.xlsx"
@@ -36,8 +37,8 @@ PANEL_LAST_ROW = PANEL_FIRST_ROW + N_STOCKS - 1      # 102
 PANEL_RANGE = f"A{PANEL_FIRST_ROW}:X{PANEL_LAST_ROW}"  # 代码+日期+22字段(16旧+6估值)
 SENTINEL_CELL = f"X{PANEL_LAST_ROW}"                  # 最后一只盈警
 
-MIN_WAIT = 3.0       # 写入后最小等待（让 Wind 启动 fetch，单元格变 "Fetch..."）
-POLL = 1.0           # 轮询间隔
+MIN_WAIT = 5.0       # 写入后最小等待（让 Wind 启动 fetch，单元格变 "Fetch..."）
+POLL = 1.5           # 轮询间隔
 STABLE_NEEDED = 2    # 连续 N 次读数一致才算收敛
 TIMEOUT = 600        # 单个日期最大等待秒（1800 公式 fetch 可能要 3-5 分钟）
 
@@ -67,6 +68,12 @@ def mondays(from_date: date, to_date: date):
 
 
 def existing_dates(conn) -> set:
+    # 只把"新估值列已填(pb 非空)"的日期算作已采 —— 使本次估值因子回拉能补全旧日期的新列，
+    # 同时仍可断点续采(已补全 pb 的日期会跳过)。
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(panel_data)")}
+    if "pb" in cols:
+        return {r[0] for r in conn.execute(
+            "SELECT DISTINCT trade_date FROM panel_data WHERE pb IS NOT NULL")}
     return {r[0] for r in conn.execute("SELECT DISTINCT trade_date FROM panel_data")}
 
 
@@ -87,24 +94,51 @@ def is_fetching(grid) -> bool:
     return False
 
 
-def wait_calc(panel_sht) -> bool:
+def _flat(grid):
+    return tuple(tuple("" if v is None else v for v in row) for row in grid)
+
+
+def wait_calc(panel_sht, prev_flat=None) -> bool:
     """写入 B1 后调用：触发重算 + 轮询直到 fetch 完成且区域稳定。返回是否收敛。
 
-    关键：只要区域里还有 "Fetch..." 占位符就继续等（不被上一周旧值骗）。
+    关键：
+    - 只要区域里还有 "Fetch..." 占位符就继续等（不被上一周旧值骗），并每隔几秒再 nudge
+      一次重算 —— Wind 异步取数有时需要反复触发才回填。
+    - 防陈旧：复用已打开的模板时,换日期后旧缓存值仍在,会被误判为"已稳定"。故要求当前
+      读数必须与"上一个日期的结果(prev_flat)"不同(收盘价等周周不同)才接受。
     """
-    panel_sht.book.app.calculate()
+    app = panel_sht.book.app
+    app.calculate()
     time.sleep(MIN_WAIT)
     prev = None
     stable = 0
     start = time.time()
+    last_calc = time.time()
     while time.time() - start < TIMEOUT:
         cur = panel_sht.range(PANEL_RANGE).value
-        if is_fetching(cur):          # 还在取数 → 重置，继续等
+        if is_fetching(cur):          # 还在取数 → 每 5s 再触发一次重算,继续等
+            if time.time() - last_calc > 5:
+                try:
+                    app.calculate()
+                except Exception:
+                    pass
+                last_calc = time.time()
             stable = 0
             prev = None
             time.sleep(POLL)
             continue
-        flat = tuple(tuple("" if v is None else v for v in row) for row in cur)
+        flat = _flat(cur)
+        if prev_flat is not None and flat == prev_flat:   # 与上一日期相同 → 还是旧缓存,继续等
+            if time.time() - last_calc > 5:
+                try:
+                    app.calculate()
+                except Exception:
+                    pass
+                last_calc = time.time()
+            stable = 0
+            prev = None
+            time.sleep(POLL)
+            continue
         if prev is not None and flat == prev and has_data(cur):
             stable += 1
             if stable >= STABLE_NEEDED:
@@ -208,23 +242,49 @@ def main():
         return
 
     log.info(f"打开 {TEMPLATE} ...")
-    # visible=True 必需：Wind 加载项(windfunc.xlam)的异步取数靠后台回调写回单元格，
-    # 隐藏/关屏幕刷新的自动化 Excel 里该回调不触发，单元格会永远停在 "Fetch..."。
-    app = xw.App(visible=True)
+    # ★ 复用已打开的 Excel 实例（Wind 只对某一个实例连接并自动取数；新开实例会永远停在
+    #   "Fetch..."）。优先用已在运行的 Excel，并尽量用其中已打开的模板；都没有才新建。
+    apps = list(xw.apps)
+    created_app = False
+    if apps:
+        app = apps[0]
+        log.info(f"复用已打开的 Excel 实例(Wind 连接的那个) — 共 {len(apps)} 个实例")
+        if len(apps) > 1:
+            log.warning("检测到多个 Excel 实例；Wind 只服务其中一个,建议只留一个再跑。")
+    else:
+        app = xw.App(visible=True)
+        created_app = True
+        log.info("未发现运行中的 Excel,新建一个实例")
     app.display_alerts = False
-    try:
+
+    # 找已打开的模板;没有才打开
+    wb = None
+    for b in list(app.books):
+        try:
+            if Path(b.fullname).name == TEMPLATE.name:
+                wb = b
+                log.info("使用已打开的 template_panel.xlsx")
+                break
+        except Exception:
+            pass
+    opened_wb = False
+    if wb is None:
         wb = app.books.open(str(TEMPLATE), update_links=False)
+        opened_wb = True
+    try:
         wb.app.calculation = "automatic"
         panel = wb.sheets["panel"]
         bench = wb.sheets["benchmark"]
         static = wb.sheets["static_info"]
 
         # static_info 一次性
+        last_flat = None
         try:
             panel.range("B1").value = todo[-1]      # 用最新日期触发 static 重算
             bench.range("B1").value = todo[-1]
             static.range("B1").value = todo[-1]
             wait_calc(panel)
+            last_flat = _flat(panel.range(PANEL_RANGE).value)   # 基线,供首个日期防陈旧
             n = save_static(conn, update_date, static)
             conn.commit()
             log.info(f"static_info 已采 {n} 行")
@@ -232,32 +292,43 @@ def main():
             log.warning(f"static_info 采集失败（可跳过）：{e}")
 
         ok = fail = 0
-        for i, m in enumerate(todo, 1):
+        pbar = tqdm(todo, desc="采集", unit="周", dynamic_ncols=True)
+        for i, m in enumerate(pbar, 1):
             ds = m.strftime("%Y-%m-%d")
             try:
                 panel.range("B1").value = m
                 bench.range("B1").value = m
-                converged = wait_calc(panel)
+                converged = wait_calc(panel, prev_flat=last_flat)
                 grid = panel.range(PANEL_RANGE).value
+                last_flat = _flat(grid)
                 nrows = save_panel(conn, update_date, ds, grid)
                 save_benchmark(conn, ds, bench)
                 ok += 1
-                flag = "" if converged else " ⚠超时(仍入库)"
-                if i % 10 == 0 or not converged:
-                    log.info(f"[{i}/{len(todo)}] {ds} → {nrows} 行{flag}")
+                pbar.set_postfix_str(f"{ds} rows={nrows} ok={ok} fail={fail}{'' if converged else ' ⚠超时'}")
+                if not converged:
+                    log.warning(f"[{i}/{len(todo)}] {ds} 超时(仍入库)")
                 if i % 20 == 0:
                     conn.commit()
             except Exception as e:
                 fail += 1
+                pbar.set_postfix_str(f"{ds} FAIL ok={ok} fail={fail}")
                 log.error(f"[{i}/{len(todo)}] {ds} 失败：{e}")
+        pbar.close()
         conn.commit()
         log.info(f"完成：成功 {ok} / 失败 {fail}")
     finally:
-        try:
-            wb.close()
-        except Exception:
-            pass
-        app.quit()
+        # 只清理自己新建/打开的;复用用户的实例与模板则保持不动
+        if opened_wb:
+            try:
+                wb.save()
+                wb.close()
+            except Exception:
+                pass
+        if created_app:
+            try:
+                app.quit()
+            except Exception:
+                pass
         conn.close()
 
 

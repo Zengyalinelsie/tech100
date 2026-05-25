@@ -545,3 +545,16 @@ Claude 拿到结果后（同一天）：
 > 验证 OK 后回拉:`uv run python scripts/collect_panel.py --backfill --from 2021-01-04`（新列;耗时与现状相当）。回拉完，新估值因子自动出现在看板「🧮 多因子选股」权重面板。
 
 *v2.2 ｜ 2026-05-25 ｜ 估值因子扩展(PB/ROE/股息率/EV-EBITDA/净负债率/盈警 + Beta 自算)*
+
+### 13.3 验证结果（2026-05-25，用户实测）
+
+| 字段 | 结果 | 处置 |
+|---|---|---|
+| PB `s_val_pb` | ✅ 正常 | 保留 |
+| ROE `s_west_avgroe` | ✅ 正常 | 保留 |
+| 股息率 `s_val_dividendyield2` | ✅ 正常 | 保留 |
+| EV/EBITDA `s_val_ev2_to_ebitda` | ❌ #NAME? → ✅ 改 `s_val_evtoebitda` 后正常 | 保留(亏损股 EBITDA<0 → 值为负,派生 ebitda_yield 时只取正值) |
+| 净负债率 `s_fa_debttoequity` | ⚠️ 全 0(个人版无数据) | **砍掉**，模板 W 列已清空 |
+| 盈警 `s_west_profitnotice` | ❌ #NAME? | **砍掉**，模板 X 列已清空 |
+
+→ **最终采集 4 个估值因子:PB / ROE / 股息率 / EV-EBITDA**(模板 S–V 列);`nde`/`profit_alert`(W/X)列保留在 schema 但长期 NaN(看板菜单按非空过滤,不显示)。

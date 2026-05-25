@@ -95,6 +95,12 @@ def load_panel(conn=None) -> pd.DataFrame:
         conn.close()
     df["trade_date"] = pd.to_datetime(df["trade_date"])
     bench["trade_date"] = pd.to_datetime(bench["trade_date"])
+    # 面板快照可多次重采：同一 (trade_date, wind_code) 会按不同 update_date 各存一份。
+    # 只保留最新一次采集（update_date 最大），否则 (日期,代码) 非唯一会让回测 reindex 报错。
+    if "update_date" in df.columns:
+        df = (df.sort_values(["wind_code", "trade_date", "update_date"])
+                .drop_duplicates(["wind_code", "trade_date"], keep="last")
+                .reset_index(drop=True))
     # 新采估值原始列：未回拉时为 NULL，读出是 object/None → 强制转 numeric（全空→NaN）
     for col in ["pb", "roe_fwd", "div_yield", "ev_ebitda", "nde", "profit_alert"]:
         if col in df.columns:
